@@ -1,0 +1,154 @@
+-- gab/pakete.gab -- lane bm1: the packet decoder.
+--
+-- The driver drops a raw Ethernet frame into `Paket` (1600 byte slots) and
+-- calls `entpacke` with the number of bytes present. `entpacke` decodes IPv4
+-- over Ethernet into `Kopf.slots[0]` exactly as ARCHITEKTUR.md fixes it and
+-- answers 1 (decoded) or 0 (malformed).
+--
+-- Bounds rule: every byte read is guarded by a comparison against `laenge`
+-- first (the firewall check) and by `narrow` second (the index evidence the
+-- checker demands). A truncated packet yields `gueltig = 0`, never a guess.
+-- A non-IPv4 EtherType, a bad version/IHL, an unknown IP protocol and -- for
+-- TCP/UDP -- a fragment (MF set or offset nonzero, whose L4 ports would be a
+-- guess, not a read) yield `gueltig = 0` as well: refuse, never interpret.
+--
+-- Write discipline: each call performs exactly one table write per field --
+-- either all eight zeroed in `ungueltig`, or all eight decoded at the single
+-- exit of `entpacke`. No field is ever written twice on one path.
+
+module brandmauer::pakete {
+
+pub table Paket count 1600 {
+    slot {
+        byte : u32 in 0 .. 255,
+    }
+}
+
+pub table Kopf count 1 {
+    slot {
+        gueltig : u32 in 0 .. 1,
+        proto : u32 in 0 .. 255,
+        quelle : u32,
+        ziel : u32,
+        qport : u32 in 0 .. 65535,
+        zport : u32 in 0 .. 65535,
+        flaggen : u32 in 0 .. 255,
+        laenge : u32 in 0 .. 65535,
+    }
+}
+
+-- Zero the decoded header and answer 0. Every malformed path funnels here,
+-- so no consumer ever sees a stale field beside `gueltig = 0`.
+impl fn ungueltig() -> u32 in 0 .. 1
+    effects { writes Kopf.slots }
+    costs <= 16 ops
+{
+    Kopf.slots[0].gueltig = 0;
+    Kopf.slots[0].proto = 0;
+    Kopf.slots[0].quelle = 0;
+    Kopf.slots[0].ziel = 0;
+    Kopf.slots[0].qport = 0;
+    Kopf.slots[0].zport = 0;
+    Kopf.slots[0].flaggen = 0;
+    Kopf.slots[0].laenge = 0;
+    return 0;
+}
+
+pub impl fn entpacke(laenge : u32 in 0 .. 1600) -> u32 in 0 .. 1
+    effects { reads Paket.slots, writes Kopf.slots }
+    costs <= 200 ops
+{
+    -- Ethernet header: 14 bytes, EtherType at 12/13.
+    if laenge < 14 { return ungueltig(); }
+    let et0 : u32 in 0 .. 255 = Paket.slots[12].byte;
+    let et1 : u32 in 0 .. 255 = Paket.slots[13].byte;
+    let etyp : u32 in 0 .. 65535 = et0 * 256 + et1;
+    if etyp != 2048 { return ungueltig(); }
+    -- Fixed IPv4 fields live at 14..33: 34 bytes.
+    if laenge < 34 { return ungueltig(); }
+    let vio : u32 in 0 .. 255 = Paket.slots[14].byte;
+    let version : u32 in 0 .. 15 = vio >> 4;
+    if version != 4 { return ungueltig(); }
+    let ihl : u32 in 0 .. 15 = vio & 15;
+    if ihl < 5 { return ungueltig(); }
+    let hlen : u32 in 20 .. 60 = ihl * 4;
+    let bo : u32 in 34 .. 74 = 14 + hlen;
+    -- The whole IP header (options included) must be present.
+    if laenge < bo { return ungueltig(); }
+    let t0 : u32 in 0 .. 255 = Paket.slots[16].byte;
+    let t1 : u32 in 0 .. 255 = Paket.slots[17].byte;
+    let tot : u32 in 0 .. 65535 = t0 * 256 + t1;
+    let f0 : u32 in 0 .. 255 = Paket.slots[20].byte;
+    let f1 : u32 in 0 .. 255 = Paket.slots[21].byte;
+    let mf : u32 in 0 .. 32 = f0 & 32;
+    let oh : u32 in 0 .. 31 = f0 & 31;
+    let versatz : u32 in 0 .. 8191 = oh * 256 + f1;
+    let proto : u32 in 0 .. 255 = Paket.slots[23].byte;
+    let q0 : u32 in 0 .. 255 = Paket.slots[26].byte;
+    let q1 : u32 in 0 .. 255 = Paket.slots[27].byte;
+    let q2 : u32 in 0 .. 255 = Paket.slots[28].byte;
+    let q3 : u32 in 0 .. 255 = Paket.slots[29].byte;
+    let qa0 : u32 = q0 * 16777216;
+    let qa1 : u32 = q1 * 65536;
+    let qa2 : u32 = q2 * 256;
+    let quelle : u32 = qa0 + qa1 + qa2 + q3;
+    let z0 : u32 in 0 .. 255 = Paket.slots[30].byte;
+    let z1 : u32 in 0 .. 255 = Paket.slots[31].byte;
+    let z2 : u32 in 0 .. 255 = Paket.slots[32].byte;
+    let z3 : u32 in 0 .. 255 = Paket.slots[33].byte;
+    let za0 : u32 = z0 * 16777216;
+    let za1 : u32 = z1 * 65536;
+    let za2 : u32 = z2 * 256;
+    let ziel : u32 = za0 + za1 + za2 + z3;
+    let mut qport : u32 in 0 .. 65535 = 0;
+    let mut zport : u32 in 0 .. 65535 = 0;
+    let mut flaggen : u32 in 0 .. 255 = 0;
+    -- Index evidence for the IHL-derived offsets below. The bounds against
+    -- `laenge` were checked above (IP header) and per protocol below; this
+    -- `narrow` only converts the range into the index type.
+    narrow bo to 0 .. 1599 else { return ungueltig(); }
+    if proto == 6 {
+        -- TCP: ports at bo..bo+3, flags byte at bo+13.
+        if mf != 0 { return ungueltig(); }
+        if versatz != 0 { return ungueltig(); }
+        if laenge < bo + 14 { return ungueltig(); }
+        let s0 : u32 in 0 .. 255 = Paket.slots[bo].byte;
+        let s1 : u32 in 0 .. 255 = Paket.slots[bo + 1].byte;
+        let d0 : u32 in 0 .. 255 = Paket.slots[bo + 2].byte;
+        let d1 : u32 in 0 .. 255 = Paket.slots[bo + 3].byte;
+        let fl : u32 in 0 .. 255 = Paket.slots[bo + 13].byte;
+        qport = s0 * 256 + s1;
+        zport = d0 * 256 + d1;
+        flaggen = fl;
+    } else {
+        if proto == 17 {
+            -- UDP: ports only.
+            if mf != 0 { return ungueltig(); }
+            if versatz != 0 { return ungueltig(); }
+            if laenge < bo + 4 { return ungueltig(); }
+            let u0 : u32 in 0 .. 255 = Paket.slots[bo].byte;
+            let u1 : u32 in 0 .. 255 = Paket.slots[bo + 1].byte;
+            let v0 : u32 in 0 .. 255 = Paket.slots[bo + 2].byte;
+            let v1 : u32 in 0 .. 255 = Paket.slots[bo + 3].byte;
+            qport = u0 * 256 + u1;
+            zport = v0 * 256 + v1;
+        } else {
+            if proto == 1 {
+                -- ICMP: ports stay 0, flags stay 0.
+            } else {
+                return ungueltig();
+            }
+        }
+    }
+    Kopf.slots[0].gueltig = 1;
+    Kopf.slots[0].proto = proto;
+    Kopf.slots[0].quelle = quelle;
+    Kopf.slots[0].ziel = ziel;
+    Kopf.slots[0].qport = qport;
+    Kopf.slots[0].zport = zport;
+    Kopf.slots[0].flaggen = flaggen;
+    Kopf.slots[0].laenge = tot;
+    return 1;
+}
+
+}
