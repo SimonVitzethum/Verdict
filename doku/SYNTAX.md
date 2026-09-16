@@ -277,6 +277,7 @@ syscalldecl = "syscall" ident "(" [ params ] ")" [ "->" typeexpr ] [ "or" ident 
               [ "requires" predlist ]
               [ "ensures"  predlist ]
               "effects" "{" efflist "}"
+              [ "costs" "<=" expr "ops" ]
               ( "assume" ident ( "falsifier" ident | "unfalsifiable" string ) ";"
               | "kernel" path ";" ) ;
 errmap     = ident "=>" ident ;
@@ -1836,6 +1837,12 @@ they point at stands in §1 beside `entrydecl`.
   assumption is named (refused as `N068` until the pairing check lands); with
   `assume`, the per-call assumption is named with its falsifier, as for a
   device (`N004`/`N005` shape).
+* **`costs <= n ops`** — the declared cost of one call through the gate. A
+  call counts it on top of the dispatch step (`1 + fa`, never zero); without
+  a countable promise the declaration falls (`N322`), no bounded loop can
+  host a call through it, and a caller with a cost promise meets `K003` over
+  it. A promise about the kernel, like `costs` at an `extern fn` — counted,
+  not re-measured.
 
 **Two places where the written example fixes the production's letter** (measured
 at the build, lane S5): the §1 production line says `regbind` (`ident ":"
@@ -1856,6 +1863,7 @@ syscall write(fd : Fd, buf : ptr<normal, r> Bytes, len : u64 in 0 .. MAXLEN)
     requires Open(fd)
     ensures  result <= len
     effects  { reads buf, writes os.fds }
+    costs    <= 8 ops
     assume   linux_write_contract falsifier sonde_write;
 …
 ```

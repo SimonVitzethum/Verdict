@@ -1,4 +1,5 @@
 -- gab/lauf.gab -- lane bm7: the program. `main`, the startup path, the worker loop.
+-- lane bm10: the decision chain between the transports.
 --
 -- What this file IS: a runnable single-worker firewall driver. `main` opens one
 -- netlink socket through the border (`netz_socket`), maps one receive buffer
@@ -6,8 +7,15 @@
 -- `setze_regel`), and then works queue 0 in `arbeite`: `netz_empfangen` into the
 -- mapped buffer, sentinel discipline (NOCHMAL is retried, PAKETE_VERLOREN is
 -- counted, KEIN_WERT ends the loop), threshold shutdown through `anhalten`.
+-- Since lane bm10 the counted datagram also runs the decision chain
+-- (`behandle`): strict parse out of Empfang (`suche_paket`), the payload copy
+-- byte by byte into Paket (`hole_nutzlast` / `setze_paket`), the verdict
+-- (`entscheide`), and the verdict bytes into Senden (`baue_urteil`) -- every
+-- step straight-line Gabbro over tables this unit never names, through
+-- `extern fn` mirrors with C-identical prototypes (the lane-bm7 shape).
 --
--- What this file IS NOT, and why (each wall is filed in messung/BEFUNDE-bm7.md):
+-- What this file IS NOT, and why (each wall is filed in messung/BEFUNDE-bm7.md,
+-- the bm10 transport wall in messung/BEFUNDE-bm10.md Befund T-1):
 -- * no `clone` worker threads: the child handoff has no checked shape
 --   (BEFUNDE-bm5.md, Befund K-1). One worker, queue 0.
 -- * no rule file: the border declares no `open`/`read` (Befund L-2). The default
@@ -16,12 +24,19 @@
 -- * no signal shutdown: the border declares no `sigaction` (Befund L-5). Shutdown
 --   happens on a packet counter threshold (GRENZE), which the operator tunes by
 --   rebuilding.
--- * no netlink parse and no verdict bytes: that is lane bm6's module
---   (`netzverbindung.gab`), which is not in this clone. The loop counts what the
---   kernel hands over and leaves the verdict path open; the exact insertion point
---   stands in a comment inside `arbeite`.
--- * no `entscheide` call: lane bm8's module (`entscheidung.gab`) is not in this
---   clone either. Calling it here would mean calling a symbol nothing defines.
+-- * no TRANSPORT in either direction: `bind`/`sendto` need a table's address
+--   as a `u64`, and `recvfrom`'s bytes need reading out of mmap'd memory --
+--   both have no producer in the language (M127, Befund L-1/T-1). The kernel
+--   autobinds on the first `recvfrom`; the `Senden` bytes `behandle` builds
+--   wait for a `sendto` no Gabbro expression can feed, and `Empfang` waits
+--   for bytes no Gabbro expression can lift out of the mapped buffer. The
+--   chain between them is real code under measurement (BERICHT-bm10.md),
+--   not a comment: the former INSERTION POINT for lanes bm6/bm8 is filled.
+--   (Lane bm11: this wall is gone -- `&T` checks since 2026-09-16. `main`
+--   binds and configures through `einrichten`, `arbeite` receives straight
+--   into `Empfang` and answers through `sende`; the mapped buffer and the
+--   `speicher_karte` call are removed. What remains unwritable is nothing
+--   on this path -- the stub is down to the four diverging exits.)
 -- * no statistics through `write`: a table's address cannot be named in this
 --   language (Befund L-1, M127), so no buffer address ever reaches `sendto`,
 --   `recvfrom`, `bind` or `write`. The only addresses this file holds are the ones
@@ -33,7 +48,7 @@
 -- calls enter as `extern fn` mirrors whose C prototypes are identical to the
 -- defining unit's (measured: the prototype lines are diffed in BERICHT-bm7.md).
 -- The unit link is `cc` over the emitted C files; no C is written by hand.
-module brandmauer::lauf {
+module verdict::lauf {
 
 -- The worker loop below is deliberately non-terminating: it ends by `leave` on
 -- the counter threshold or on a dead socket, or by the environment (more packets
@@ -63,6 +78,20 @@ impl fn sonde_dose() -> bool
     return true;
 }
 
+-- Progress for the payload copy: the message ends after finitely many
+-- bytes -- pass i moves byte i, and n (at most 1600) bounds the passes.
+-- Same shape as the two above, own name so the copy loop names its end.
+assume kopie_endet
+    "Die Nutzdatenkopie endet nach endlich vielen Durchgaengen: Durchgang i bewegt Byte i, bei n ist Schluss."
+    falsifier sonde_kopie;
+
+impl fn sonde_kopie() -> bool
+    effects { pure }
+    costs <= 4 ops
+{
+    return true;
+}
+
 -- Watchdog for the bounded loops. Diverging, as the bound demands: when the
 -- bound is exhausted the process does not carry on with a number that meant
 -- nothing. (Only `forever` lowers to C in this binary -- both `retry` shapes
@@ -82,16 +111,52 @@ extern fn lauf_aufgegeben() -> never effects { diverges };
 -- carrier of this unit; what the kernel does behind the call is the named
 -- `assume` in systemrufe.gab, not an effect here.
 extern fn netz_socket() -> u64 effects { pure };
-extern fn netz_empfangen(fd : u64, puffer : u64, laenge : u64, zeichen : u64, quelle : u64, quell_laenge : u64) -> u64 effects { pure };
-extern fn speicher_karte(laenge : u64) -> u64 effects { pure };
 extern fn anhalten(status : u64) -> u64 effects { pure };
+
+-- Transport mirrors (lane bm11). Each line mirrors one `pub` function of
+-- gab/netzverbindung.gab (`einrichten`, `sende`, `empfange`) with the
+-- C-identical parameter list: file descriptors, counts and lengths travel
+-- as plain `u64` -- no table ever crosses this boundary (the pointer stays
+-- inside `gab/netzverbindung.gab`, which owns the memory). `effects
+-- { pure }` is the house convention above.
+extern fn einrichten(steckdose : u64) -> u64 effects { pure } costs <= 829 ops;
+extern fn sende(steckdose : u64, laenge : u64) -> u64 effects { pure } costs <= 19 ops;
+extern fn empfange(steckdose : u64, laenge : u64) -> u64 effects { pure } costs <= 19 ops;
 
 -- Loader mirrors. Each line mirrors one `pub` function of gab/regeln.gab with
 -- the C-identical parameter list: `index into Regel` lowers to `uint32_t`, so
 -- the slot travels as a plain `u32` here (the prototype diff stands in
 -- BERICHT-bm7.md). The ranges mirror the originals field by field.
-extern fn raeume_alle() effects { pure };
-extern fn setze_regel(i : u32, aktiv : u32 in 0 .. 1, proto_any : u32 in 0 .. 1, proto : u32 in 0 .. 255, quell_any : u32 in 0 .. 1, quelle : u32, qmask : u32, ziel_any : u32 in 0 .. 1, ziel : u32, zmask : u32, qport_any : u32 in 0 .. 1, qport_lo : u32 in 0 .. 65535, qport_hi : u32 in 0 .. 65535, zport_any : u32 in 0 .. 1, zport_lo : u32 in 0 .. 65535, zport_hi : u32 in 0 .. 65535, flaggen_any : u32 in 0 .. 1, flaggen_maske : u32 in 0 .. 255, flaggen_wert : u32 in 0 .. 255, urteil : u32 in 0 .. 2, nummer : u32 in 0 .. 255) effects { pure };
+extern fn raeume_alle() effects { pure } costs <= 1024 ops;
+extern fn setze_regel(i : u32, aktiv : u32 in 0 .. 1, proto_any : u32 in 0 .. 1, proto : u32 in 0 .. 255, quell_any : u32 in 0 .. 1, quelle : u32, qmask : u32, ziel_any : u32 in 0 .. 1, ziel : u32, zmask : u32, qport_any : u32 in 0 .. 1, qport_lo : u32 in 0 .. 65535, qport_hi : u32 in 0 .. 65535, zport_any : u32 in 0 .. 1, zport_lo : u32 in 0 .. 65535, zport_hi : u32 in 0 .. 65535, flaggen_any : u32 in 0 .. 1, flaggen_maske : u32 in 0 .. 255, flaggen_wert : u32 in 0 .. 255, urteil : u32 in 0 .. 2, nummer : u32 in 0 .. 255) effects { pure } costs <= 60 ops;
+
+-- Decision-chain mirrors (lane bm10). Each line mirrors one `pub` function of
+-- gab/netzverbindung.gab (`suche_paket`, `gib_laenge`, `hole_nutzlast`,
+-- `gib_kennung`, `baue_urteil`), gab/pakete.gab (`setze_paket`) or
+-- gab/entscheidung.gab (`entscheide`) with the C-identical parameter list:
+-- ranges travel (an `extern fn` with ranged results is clean -- BEFUNDE-bm9.md
+-- B-4), and `index into Paket` lowers to `uint32_t` (same precedent as
+-- `setze_regel` above; the prototype diff stands in BERICHT-bm10.md).
+-- `effects { pure }` is the house convention of this file: no mirror touches
+-- a Gabbro carrier OF THIS UNIT, and what the kernel or the owning unit does
+-- behind the call is the named `assume` there, not an effect here. Price,
+-- stated: across these edges the caller's M147 coverage goes blind (the same
+-- price as the loader mirrors above) -- the staleness the decision needs is
+-- handled INSIDE gab/entscheidung.gab, which carries the true footprints
+-- (BEFUNDE-bm9.md B-1/B-4). What the checker cannot confirm from one file is
+-- refuted at the C prototype diff and the link instead (BERICHT-bm10.md).
+-- Deliberately NOT mirrored: `lege_empfang` (no byte source -- the mmap'd
+-- buffer has no Gabbro read), `netz_binden`/`netz_senden` (no table address
+-- -- M127), and the config builders `baue_binden`/`baue_werte`/`baue_wartelang`/
+-- `baue_merkmale` (each overwrites Senden from slot 0, so building without
+-- the withheld `sendto` between builds is theatre -- Befund T-1).
+extern fn suche_paket(meldung : u32 in 0 .. 8192) -> u32 in 0 .. 7 effects { pure } costs <= 301000 ops;
+extern fn gib_laenge() -> u32 in 0 .. 1600 effects { pure } costs <= 4 ops;
+extern fn hole_nutzlast(i : u32 in 0 .. 1599) -> u32 in 0 .. 255 effects { pure } costs <= 16 ops;
+extern fn gib_kennung() -> u32 effects { pure } costs <= 4 ops;
+extern fn baue_urteil(kennung : u32, urteil : u32 in 0 .. 2, reihung : u32 in 0 .. 65535) -> u32 in 0 .. 64 effects { pure } costs <= 152 ops;
+extern fn setze_paket(i : u32, w : u32 in 0 .. 255) effects { pure } costs <= 4 ops;
+extern fn entscheide(laenge : u32 in 0 .. 1600, faden : u32 in 0 .. 15) -> u32 in 0 .. 2 effects { pure };
 
 -- The three sentinels of the border contract (values copied from
 -- gab/systemrufe.gab): NOCHMAL means EINTR/EAGAIN, call again; PAKETE_VERLOREN
@@ -101,12 +166,20 @@ pub const NOCHMAL : u64 = u64::max - 1;
 pub const PAKETE_VERLOREN : u64 = u64::max - 2;
 
 -- The queue this worker serves. Single worker, queue 0; scale-out is a root
--- procedure (BERICHT-bm7.md), not a second thread (K-1).
-pub const WARTESCHLANGE : u32 = 0;
+-- procedure (BERICHT-bm7.md), not a second thread (K-1). Ranged: the verdict
+-- builder takes the queue number as `u32 in 0 .. 65535`, and this constant
+-- travels there without a `narrow`. Own name (not `WARTESCHLANGE`): that name
+-- already means the queue DEPTH (1024) in gab/netzverbindung.gab -- same C
+-- macro, different value, and the composed link would not compile (Befund
+-- T-2). The number here is the queue's NUMBER on the wire (res_id).
+pub const WARTESCHLANGEN_NR : u32 in 0 .. 65535 = 0;
 
--- Receive buffer size in bytes. 65536 covers the largest netlink datagram the
--- queue hands over; the driver truncates nothing, the buffer is mapped once.
-pub const PUFFER_GROESSE : u64 = 65536;
+-- Receive bound in bytes: what one `empfange` call may write into `Empfang`
+-- and what `suche_paket` may parse. Same number as
+-- `gab/netzverbindung.gab`'s `EMPFANG_GROESSE` (8192); a literal here
+-- because constants do not cross the single-file gate -- the narrow below
+-- proves it at the call.
+pub const EMPFANG_SCHRANKE : u64 = 8192;
 
 -- Shutdown threshold: packets received before the worker leaves its loop and
 -- the process ends through `anhalten`. Signal handling would need `sigaction`,
@@ -118,14 +191,16 @@ pub const GRENZE : u32 = 1000000;
 -- runs before the loop, the loop owns the row. A lock here would be a contract
 -- nobody takes (same reading as BEFUNDE-bm2.md for the rule table), so the
 -- E247 footprint hints stand, documented there and in BEFUNDE-bm7.md.
--- Fields: received datagrams, ENOBUFS events, EINTR/EAGAIN retries, and the
--- shutdown reason (0 clean, 120 receive path dead).
+-- Fields: received datagrams, ENOBUFS events, EINTR/EAGAIN retries,
+-- datagrams refused by the strict parse (no verdict built -- lane bm10),
+-- and the shutdown reason (0 clean, 120 receive path dead).
 pub table LaufStand count 1 {
     slot {
         pakete : u32,
         verlust : u32,
         nochmal : u32,
         fehler : u32,
+        strikt : u32,
     }
 }
 
@@ -135,27 +210,72 @@ pub table LaufStand count 1 {
 -- closed; a firewall nobody configured drops.
 impl fn lade_grundregeln()
     effects { pure }
+    costs <= 1084 ops
 {
     raeume_alle();
     setze_regel(0, 1, 0, 6, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 80, 80, 1, 0, 0, 1, 0);
     return;
 }
 
--- The worker. One pass is one `netz_empfangen` into the mapped buffer:
--- NOCHMAL is not a failure (counted, next pass), PAKETE_VERLOREN is not a
--- failure either (counted in `verlust`, next pass -- the operator learns it
--- from the row and from the exit status), KEIN_WERT ends the loop with the
--- reason in `fehler`. Any other answer is a byte count: counted in `pakete`,
--- and at GRENZE the loop leaves for shutdown.
---
--- INSERTION POINT for lanes bm6/bm8: where the `else` arm counts the packet,
--- the netlink parse (`nfgenmsg`/Attribute in bm6's module), the copy into the
--- `Paket` table, the `entscheide(laenge, faden)` call (bm8) and the verdict
--- `sendto` belong. They are not here because neither defining module is in
--- this clone and because the byte copy needs an address-of the language
--- refuses (Befund L-1). Nothing in this loop changes shape when they land:
--- parse, decide and answer happen inside that arm, per datagram.
-impl fn arbeite(steckdose : u64, puffer : u64)
+-- One datagram through the decision chain: strict-parse the netlink message
+-- out of Empfang, copy the payload byte by byte into Paket, decide, build
+-- the verdict bytes into Senden. Answers the verdict length for `sende` --
+-- 0 when the strict parse refused (then no verdict was built, never a
+-- guess: the same discipline as `suche_paket`'s named Zustand and
+-- `entpacke`'s `ungueltig`). `pub`: the measurement harness calls it
+-- directly (BERICHT-bm11.md).
+pub impl fn behandle(meldung : u32 in 0 .. 8192) -> u32 in 0 .. 64
+    effects { pure }
+{
+    let zustand : u32 in 0 .. 7 = suche_paket(meldung);
+    if zustand != 0 {
+        return 0;
+    }
+    -- The payload copy: n bytes (`gib_laenge`, 0 .. 1600) out of Empfang
+    -- (`hole_nutzlast`, bound-checked against the recorded length AND the
+    -- buffer count) into Paket (`setze_paket`). `i` is guarded twice:
+    -- against `n` (the message) and by `narrow` (the index evidence the
+    -- checker demands -- the same double discipline as gab/pakete.gab's
+    -- decoder and gab/verbindungen.gab's buckets).
+    let n : u32 in 0 .. 1600 = gib_laenge();
+    let mut i : u32 = 0;
+    forever kopie
+        per_pass bounded 64 ops
+        on_exceeded lauf_aufgegeben
+        effects { pure }
+        progress kopie_endet
+    {
+        if i >= n {
+            leave kopie;
+        }
+        narrow i to 0 .. 1599 else {
+            leave kopie;
+        }
+        let b : u32 in 0 .. 255 = hole_nutzlast(i);
+        setze_paket(i, b);
+        i += 1;
+    }
+    -- Decide on this worker (faden 0: one worker, queue 0 -- K-1) and build
+    -- the verdict over the parsed packet id. `kennung` is read AFTER the
+    -- decision (V4): no name here can go stale.
+    let urteil : u32 in 0 .. 2 = entscheide(n, 0);
+    let kennung : u32 = gib_kennung();
+    let lang : u32 in 0 .. 64 = baue_urteil(kennung, urteil, WARTESCHLANGEN_NR);
+    return lang;
+}
+
+-- The worker. One pass is one `empfange` straight into `Empfang` (lane
+-- bm11 -- the kernel writes the owner's memory through the pointer; no
+-- mapped buffer stands between them any more): NOCHMAL is not a failure
+-- (counted, next pass), PAKETE_VERLOREN is not a failure either (counted
+-- in `verlust`, next pass -- the operator learns it from the row and from
+-- the exit status), KEIN_WERT ends the loop with the reason in `fehler`.
+-- Any other answer is a byte count: the datagram runs the decision chain
+-- (`behandle`), a refused parse is counted in `strikt` (no verdict built,
+-- none sent), a built verdict is answered through `sende` (a lost answer
+-- is counted in `verlust` -- with FAIL_OPEN the kernel may pass that
+-- packet uncounted), and at GRENZE the loop leaves for shutdown.
+impl fn arbeite(steckdose : u64)
     effects { reads LaufStand, writes LaufStand.slots }
 {
     forever runde
@@ -164,7 +284,7 @@ impl fn arbeite(steckdose : u64, puffer : u64)
         effects { reads LaufStand, writes LaufStand.slots }
         progress paketstrom_fliesst
     {
-        let v : u64 = netz_empfangen(steckdose, puffer, PUFFER_GROESSE, 0, 0, 0);
+        let v : u64 = empfange(steckdose, EMPFANG_SCHRANKE);
         if v == NOCHMAL {
             if LaufStand.slots[0].nochmal < u32::max {
                 LaufStand.slots[0].nochmal += 1;
@@ -179,11 +299,57 @@ impl fn arbeite(steckdose : u64, puffer : u64)
                     LaufStand.slots[0].fehler = 120;
                     leave runde;
                 } else {
-                    if LaufStand.slots[0].pakete < u32::max {
-                        LaufStand.slots[0].pakete += 1;
-                    }
-                    if LaufStand.slots[0].pakete >= GRENZE {
-                        leave runde;
+                    -- v is a byte count here (all three sentinels handled
+                    -- above). Empfang holds 8192 bytes: an oversize datagram
+                    -- never reaches the parse -- counted as loss, next pass.
+                    -- The `narrow` below is the index evidence `suche_paket`
+                    -- demands; its `else` diverges (`next`), and the `u32`
+                    -- call after it is the conversion (both shapes probed
+                    -- clean -- Befund T-1).
+                    if v > 8192 {
+                        if LaufStand.slots[0].verlust < u32::max {
+                            LaufStand.slots[0].verlust += 1;
+                        }
+                    } else {
+                        narrow v to 0 .. 8192 else {
+                            next runde;
+                        }
+                        let meldung : u32 in 0 .. 8192 = u32(v);
+                        let gebaut : u32 in 0 .. 64 = behandle(meldung);
+                        if gebaut == 0 {
+                            -- Strict parse refused: counted, next pass.
+                            -- No verdict was built, none is sent.
+                            if LaufStand.slots[0].strikt < u32::max {
+                                LaufStand.slots[0].strikt += 1;
+                            }
+                        } else {
+                            let geschickt : u64 = sende(steckdose, gebaut);
+                            if geschickt == NOCHMAL {
+                                if LaufStand.slots[0].nochmal < u32::max {
+                                    LaufStand.slots[0].nochmal += 1;
+                                }
+                                if LaufStand.slots[0].verlust < u32::max {
+                                    LaufStand.slots[0].verlust += 1;
+                                }
+                            } else {
+                                if geschickt == PAKETE_VERLOREN {
+                                    if LaufStand.slots[0].verlust < u32::max {
+                                        LaufStand.slots[0].verlust += 1;
+                                    }
+                                } else {
+                                    if geschickt == KEIN_WERT {
+                                        LaufStand.slots[0].fehler = 120;
+                                        leave runde;
+                                    }
+                                }
+                            }
+                        }
+                        if LaufStand.slots[0].pakete < u32::max {
+                            LaufStand.slots[0].pakete += 1;
+                        }
+                        if LaufStand.slots[0].pakete >= GRENZE {
+                            leave runde;
+                        }
                     }
                 }
             }
@@ -199,8 +365,10 @@ impl fn arbeite(steckdose : u64, puffer : u64)
 --   1   threshold reached, drops were counted (see `verlust`);
 --   110 the socket never came up (KEIN_WERT or PAKETE_VERLOREN at startup, or
 --       64 NOCHMAL answers in a row);
---   111 the receive buffer never mapped;
---   120 the receive path died (KEIN_WERT from `netz_empfangen`).
+--   112 the queue was never configured (`einrichten` answered nonzero --
+--       bind or one of the three config sends failed; fail closed, the
+--       queue delivers nothing and the operator restarts);
+--   120 the receive path died (KEIN_WERT from `empfange` or `sende`).
 pub impl fn main() -> i32
     effects { reads LaufStand, writes LaufStand.slots }
 {
@@ -238,26 +406,18 @@ pub impl fn main() -> i32
         anhalten(110);
         return 110;
     }
-    -- Startup: one receive buffer. Anonymous memory, read/write, private; the
-    -- answer is the base address the kernel chose, handed to `netz_empfangen`
-    -- as a `u64` -- the one address shape this language can carry.
-    let puffer : u64 = speicher_karte(PUFFER_GROESSE);
-    if puffer == KEIN_WERT {
-        anhalten(111);
-        return 111;
-    }
-    if puffer == NOCHMAL {
-        anhalten(111);
-        return 111;
-    }
-    if puffer == PAKETE_VERLOREN {
-        anhalten(111);
-        return 111;
+    -- Startup: bind the address and configure queue 0 (lane bm11). Nonzero
+    -- is not a packet verdict but a startup verdict: the queue stays
+    -- unbound, nothing is filtered, the operator restarts.
+    let eingerichtet : u64 = einrichten(steckdose);
+    if eingerichtet != 0 {
+        anhalten(112);
+        return 112;
     }
     -- Startup: the compiled-in default policy, before the first datagram.
     lade_grundregeln();
     -- Work. Returns only through `leave`: threshold or dead socket.
-    arbeite(steckdose, puffer);
+    arbeite(steckdose);
     if LaufStand.slots[0].fehler == 120 {
         anhalten(120);
         return 120;

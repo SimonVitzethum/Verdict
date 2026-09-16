@@ -19,7 +19,7 @@
 -- names none. The checker's footprint hints (E247) that follow from this are
 -- recorded in messung/BEFUNDE-bm2.md.
 
-module brandmauer::regeln {
+module verdict::regeln {
 
 -- How many rules the table holds. Fixed at compile time: no allocator, no
 -- growth under load. A firewall that cannot hold a rule drops it at load

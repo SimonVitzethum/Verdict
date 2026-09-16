@@ -27,6 +27,18 @@
 --      sentinels live there.
 module systemrufe {
 
+-- Tables this border's transports ride on (lane bm11). `use` names them
+-- for the `ptr` parameter types below; the STORAGE stays with the owner
+-- (`gab/netzverbindung.gab`) -- what crosses into this file is the type,
+-- and at run time a caller-handed pointer into the owner's memory
+-- (measured: `pruefe --with bau/netz.gabi`, emit writes `struct Senden *`
+-- parameters; the unit's own virgin copies are never touched -- see the
+-- wrappers). Single-file `pruefe` of this file needs `bau/netz.gabi`
+-- (Makefile); without it the three names below are M119.
+use verdict::netzverbindung::Senden;
+use verdict::netzverbindung::Empfang;
+use verdict::netzverbindung::Adresse;
+
 -- The error channel. Shared by all ten calls so that every lane matches
 -- against one closed list (`exhaustive`: a new case breaks every match,
 -- which is the point).
@@ -93,6 +105,7 @@ syscall roh_socket(gebiet : u64, typ : u64, protokoll : u64) -> u64 or NetzFehle
              EMFILE => ZuVieleDateien, ENFILE => SystemVoll, ENOMEM => KeinSpeicher,
              EACCES => KeinZugriff, EINVAL => FalscherWert, EINTR => Unterbrochen }
     effects { pure }
+    costs <= 8 ops
     assume linux_netz_socket_vertrag falsifier sonde_netz_socket;
 
 -- bind: binding the netlink address.
@@ -115,6 +128,7 @@ syscall roh_binden(fd : u64, adresse : u64, laenge : u64) -> u64 or NetzFehler
     errors { EBADF => SchlechterFd, EINVAL => FalscherWert, EACCES => KeinZugriff,
              ENOMEM => KeinSpeicher, EINTR => Unterbrochen, EAGAIN => Wiederholen }
     effects { pure }
+    costs <= 8 ops
     assume linux_netz_binden_vertrag falsifier sonde_netz_binden;
 
 -- sendto: configuration messages and every verdict. Six registers; the
@@ -139,6 +153,7 @@ syscall roh_senden(fd : u64, nachricht : u64, laenge : u64, zeichen : u64, ziel 
              EBADF => SchlechterFd, EFAULT => FehlerAdresse, EINVAL => FalscherWert,
              ENOMEM => KeinSpeicher, EACCES => KeinZugriff, EPIPE => LeitungWeg }
     effects { pure }
+    costs <= 8 ops
     assume linux_netz_senden_vertrag falsifier sonde_netz_senden;
 
 -- recvfrom: receiving queued packets. ENOBUFS here means the kernel dropped
@@ -164,6 +179,7 @@ syscall roh_empfangen(fd : u64, puffer : u64, laenge : u64, zeichen : u64, quell
              EBADF => SchlechterFd, EFAULT => FehlerAdresse, EINVAL => FalscherWert,
              ENOMEM => KeinSpeicher }
     effects { pure }
+    costs <= 8 ops
     assume linux_netz_empfangen_vertrag falsifier sonde_netz_empfangen;
 
 -- mmap: the per-thread receive buffers and the thread stacks. Anonymous
@@ -188,6 +204,7 @@ syscall roh_karte(adresse : u64, laenge : u64, schutz : u64, zeichen : u64, fd :
     errors { ENOMEM => KeinSpeicher, EINVAL => FalscherWert, EBADF => SchlechterFd,
              EACCES => KeinZugriff, EAGAIN => Wiederholen, EPERM => Verboten }
     effects { pure }
+    costs <= 8 ops
     assume linux_speicher_karte_vertrag falsifier sonde_speicher_karte;
 
 -- clone: the worker threads. THE call that decides whether this project is
@@ -215,6 +232,7 @@ syscall roh_klonen(kind : u64, stapel : u64, eltern : u64, kindspeicher : u64, t
     errors { EAGAIN => Wiederholen, ENOMEM => KeinSpeicher,
              EINVAL => FalscherWert, EPERM => Verboten }
     effects { pure }
+    costs <= 8 ops
     assume linux_faden_start_vertrag falsifier sonde_faden_start;
 
 -- futex: waiting without spinning, where a lock must block. EAGAIN on
@@ -239,6 +257,7 @@ syscall roh_warten(adresse : u64, vorgang : u64, wert : u64, frist : u64) -> u64
     errors { EINTR => Unterbrochen, EAGAIN => Wiederholen, EINVAL => FalscherWert,
              EFAULT => FehlerAdresse, ETIMEDOUT => ZeitUm }
     effects { pure }
+    costs <= 8 ops
     assume linux_sperre_vertrag falsifier sonde_sperre;
 
 -- clock_gettime: the connection timeouts.
@@ -260,6 +279,7 @@ syscall roh_uhr(uhr : u64, adresse : u64) -> u64 or NetzFehler
     clobbers { rcx, r11 }
     errors { EINVAL => FalscherWert, EFAULT => FehlerAdresse }
     effects { pure }
+    costs <= 8 ops
     assume linux_zeit_lesen_vertrag falsifier sonde_zeit_lesen;
 
 -- exit_group: shutting down. The call never returns, so there is no failure
@@ -287,6 +307,7 @@ syscall roh_ende(status : u64) -> u64 or NetzFehler
     clobbers { rcx, r11 }
     errors { EINTR => Unterbrochen }
     effects { pure }
+    costs <= 8 ops
     assume linux_anhalten_vertrag falsifier sonde_anhalten;
 
 -- write: statistics on stderr. The wrapper `bericht_schreiben` fixes fd 2;
@@ -311,6 +332,7 @@ syscall roh_schreiben(fd : u64, puffer : u64, laenge : u64) -> u64 or NetzFehler
              EFAULT => FehlerAdresse, EINVAL => FalscherWert, ENOMEM => KeinSpeicher,
              EPIPE => LeitungWeg }
     effects { pure }
+    costs <= 8 ops
     assume linux_bericht_schreiben_vertrag falsifier sonde_bericht_schreiben;
 
 -- The thin typed wrappers. Nobody else touches a register map: each lane
@@ -322,6 +344,12 @@ syscall roh_schreiben(fd : u64, puffer : u64, laenge : u64) -> u64 or NetzFehler
 -- No wrapper carries `costs`: a call to a `syscall` item declares none, and
 -- a promise over an unknown quantity is refused (K003). The contract the
 -- caller keeps instead is written at each wrapper.
+-- (Lane bm11: every `syscall` below now declares `costs <= 8 ops` (N322 --
+-- the dispatch-bound convention of `beispiele/90-syscall-errno.gab`), so
+-- the three `netz_*2` transport wrappers at the end of this file DO promise
+-- their computed costs. The ten old wrappers keep the convention above:
+-- their callers reach them through costless `extern` mirrors, and a promise
+-- no caller can rely on is decoration, not information.)
 
 pub impl fn netz_socket() -> u64
     effects { pure }
@@ -597,6 +625,136 @@ pub impl fn bericht_schreiben(adresse : u64, laenge : u64) -> u64
     effects { pure }
 {
     let v = roh_schreiben(FEHLER_AUSGABE, adresse, laenge) else (e) {
+        match e {
+            Unterbrochen => { return NOCHMAL; }
+            Wiederholen => { return NOCHMAL; }
+            KeinSpeicher => { return KEIN_WERT; }
+            PaketeVerloren => { return PAKETE_VERLOREN; }
+            FalscherWert => { return KEIN_WERT; }
+            SchlechterFd => { return KEIN_WERT; }
+            FehlerAdresse => { return KEIN_WERT; }
+            FamilieFehlt => { return KEIN_WERT; }
+            ProtokollFehlt => { return KEIN_WERT; }
+            ZuVieleDateien => { return KEIN_WERT; }
+            SystemVoll => { return KEIN_WERT; }
+            Verboten => { return KEIN_WERT; }
+            KeinZugriff => { return KEIN_WERT; }
+            ZeitUm => { return KEIN_WERT; }
+            LeitungWeg => { return KEIN_WERT; }
+        }
+    }
+    return v;
+}
+
+-- The table transports (lane bm11). The ten calls above take every address
+-- as `u64` -- a table's address has no producer for them (M127 stood here
+-- until 2026-09-16). These three take it as a `ptr` over the used tables:
+-- the emitter writes `&Senden_speicher` at the call site and a
+-- `struct Senden *` parameter at the stub, and the register carries the
+-- owner's memory, not a number (M140 guards the confusion). Same numbers,
+-- same register maps, same error maps, same assumes as their `u64`
+-- siblings -- only the address changes shape. The pointer is a PARAMETER:
+-- the caller hands its own memory (`&Senden` in `gab/netzverbindung.gab`,
+-- which owns it); this file's TU-local copies of the used tables (which
+-- `emit --with` writes per translation unit) are never referenced in any
+-- body below -- virgin storage, documented, not read. File descriptors,
+-- counts and lengths cross every boundary as values, exactly as before.
+
+syscall roh_binden2(fd : u64, adresse : ptr<normal, r> Adresse, laenge : u64) -> u64 or NetzFehler
+    abi linux arch x86_64 number 49
+    regs in { rdi = fd, rsi = adresse, rdx = laenge }
+    regs out { rax }
+    clobbers { rcx, r11 }
+    errors { EBADF => SchlechterFd, EINVAL => FalscherWert, EACCES => KeinZugriff,
+             ENOMEM => KeinSpeicher, EINTR => Unterbrochen, EAGAIN => Wiederholen }
+    effects { reads Adresse.slots }
+    costs <= 8 ops
+    assume linux_netz_binden_vertrag falsifier sonde_netz_binden;
+
+syscall roh_senden2(fd : u64, nachricht : ptr<normal, r> Senden, laenge : u64, zeichen : u64, ziel : u64, ziel_laenge : u64) -> u64 or NetzFehler
+    abi linux arch x86_64 number 44
+    regs in { rdi = fd, rsi = nachricht, rdx = laenge, r10 = zeichen, r8 = ziel, r9 = ziel_laenge }
+    regs out { rax }
+    clobbers { rcx, r11 }
+    errors { EINTR => Unterbrochen, EAGAIN => Wiederholen, ENOBUFS => PaketeVerloren,
+             EBADF => SchlechterFd, EFAULT => FehlerAdresse, EINVAL => FalscherWert,
+             ENOMEM => KeinSpeicher, EACCES => KeinZugriff, EPIPE => LeitungWeg }
+    effects { reads Senden.slots }
+    costs <= 8 ops
+    assume linux_netz_senden_vertrag falsifier sonde_netz_senden;
+
+syscall roh_empfangen2(fd : u64, puffer : ptr<normal, rw> Empfang, laenge : u64, zeichen : u64, quelle : u64, quell_laenge : u64) -> u64 or NetzFehler
+    abi linux arch x86_64 number 45
+    regs in { rdi = fd, rsi = puffer, rdx = laenge, r10 = zeichen, r8 = quelle, r9 = quell_laenge }
+    regs out { rax }
+    clobbers { rcx, r11 }
+    errors { EINTR => Unterbrochen, EAGAIN => Wiederholen, ENOBUFS => PaketeVerloren,
+             EBADF => SchlechterFd, EFAULT => FehlerAdresse, EINVAL => FalscherWert,
+             ENOMEM => KeinSpeicher }
+    effects { writes Empfang.slots }
+    costs <= 8 ops
+    assume linux_netz_empfangen_vertrag falsifier sonde_netz_empfangen;
+
+-- Transport wrappers: one attempt each, same three sentinels. Unlike the
+-- ten above these promise their computed costs (every callee declares its
+-- own since N322) -- the numbers stand in `kosten` output, not here first.
+pub impl fn netz_binden2(fd : u64, adresse : ptr<normal, r> Adresse) -> u64
+    effects { reads Adresse.slots }
+    costs <= 14 ops
+{
+    let v = roh_binden2(fd, adresse, 12) else (e) {
+        match e {
+            Unterbrochen => { return NOCHMAL; }
+            Wiederholen => { return NOCHMAL; }
+            KeinSpeicher => { return KEIN_WERT; }
+            PaketeVerloren => { return PAKETE_VERLOREN; }
+            FalscherWert => { return KEIN_WERT; }
+            SchlechterFd => { return KEIN_WERT; }
+            FehlerAdresse => { return KEIN_WERT; }
+            FamilieFehlt => { return KEIN_WERT; }
+            ProtokollFehlt => { return KEIN_WERT; }
+            ZuVieleDateien => { return KEIN_WERT; }
+            SystemVoll => { return KEIN_WERT; }
+            Verboten => { return KEIN_WERT; }
+            KeinZugriff => { return KEIN_WERT; }
+            ZeitUm => { return KEIN_WERT; }
+            LeitungWeg => { return KEIN_WERT; }
+        }
+    }
+    return v;
+}
+
+pub impl fn netz_senden2(fd : u64, nachricht : ptr<normal, r> Senden, laenge : u64) -> u64
+    effects { reads Senden.slots }
+    costs <= 15 ops
+{
+    let v = roh_senden2(fd, nachricht, laenge, 0, 0, 0) else (e) {
+        match e {
+            Unterbrochen => { return NOCHMAL; }
+            Wiederholen => { return NOCHMAL; }
+            KeinSpeicher => { return KEIN_WERT; }
+            PaketeVerloren => { return PAKETE_VERLOREN; }
+            FalscherWert => { return KEIN_WERT; }
+            SchlechterFd => { return KEIN_WERT; }
+            FehlerAdresse => { return KEIN_WERT; }
+            FamilieFehlt => { return KEIN_WERT; }
+            ProtokollFehlt => { return KEIN_WERT; }
+            ZuVieleDateien => { return KEIN_WERT; }
+            SystemVoll => { return KEIN_WERT; }
+            Verboten => { return KEIN_WERT; }
+            KeinZugriff => { return KEIN_WERT; }
+            ZeitUm => { return KEIN_WERT; }
+            LeitungWeg => { return KEIN_WERT; }
+        }
+    }
+    return v;
+}
+
+pub impl fn netz_empfangen2(fd : u64, puffer : ptr<normal, rw> Empfang, laenge : u64) -> u64
+    effects { writes Empfang.slots }
+    costs <= 15 ops
+{
+    let v = roh_empfangen2(fd, puffer, laenge, 0, 0, 0) else (e) {
         match e {
             Unterbrochen => { return NOCHMAL; }
             Wiederholen => { return NOCHMAL; }

@@ -1,4 +1,4 @@
--- gab/zaehler.gab -- Brandmauer lane bm4: concurrent packet counters.
+-- gab/zaehler.gab -- Verdict lane bm4: concurrent packet counters.
 --
 -- Every worker thread counts through this module: packets seen (GESAMT),
 -- per-verdict outcomes (VERWORFEN/DROP, AKZEPTIERT/ACCEPT, ABGEWIESEN/REJECT),
@@ -43,7 +43,7 @@
 -- Per-rule values come from `lies_regel_treffer(r)`: 16 addresses cannot
 -- name 256 rules.
 
-module brandmauer::zaehler {
+module verdict::zaehler {
 
 -- The seven scalar counters.
 pub atomic GESAMT : u32 relaxed;

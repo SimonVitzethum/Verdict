@@ -53,7 +53,7 @@
 -- Zustand, never a guess. A payload longer than 1600 bytes is capped at 1600
 -- (ARCHITEKTUR.md: a longer packet is truncated by the driver), with the
 -- capped length recorded. Unknown attributes (MARK, TIMESTAMP, ...) are skipped.
-module brandmauer::netzverbindung {
+module verdict::netzverbindung {
 
 -- Message sizes the kernel ABI fixes (linux/netlink.h, nfnetlink.h,
 -- nfnetlink_queue.h -- read off the local headers, see BERICHT-bm6.md).
@@ -140,6 +140,17 @@ pub table Ergebnis count 1 {
     }
 }
 
+-- The socket address this worker binds: `sockaddr_nl` as 16 byte slots
+-- (family, pad, pid, groups -- 12 used, 4 headroom). Filled once by
+-- `lege_adresse`, handed to the kernel by address (`&Adresse`) through
+-- `gab/systemrufe.gab`'s `netz_binden2` -- the one address of this file
+-- the border may name, now that `&T` checks (M127 gefallen, lane bm11).
+pub table Adresse count 16 {
+    slot {
+        byte : Einzelbyte,
+    }
+}
+
 -- Little-endian host: the ..._he writes below store low-byte-first, which is
 -- host order only where the host is little-endian (x86_64). The falsifier is
 -- shape-only -- a real probe would have to reinterpret a word as bytes,
@@ -192,6 +203,29 @@ pub impl fn lege_empfang(i : index into Empfang, w : Einzelbyte)
     costs <= 4 ops
 {
     Empfang.slots[i].byte = w;
+    return;
+}
+
+-- Fill the socket address (lane bm11): `sockaddr_nl` for this worker --
+-- family AF_NETLINK (16), pad, pid 0 (the kernel assigns), groups 0
+-- (no multicast). Twelve bytes used of sixteen; `netz_binden2` in
+-- `gab/systemrufe.gab` hands exactly those twelve to the kernel.
+pub impl fn lege_adresse()
+    effects { reads Adresse, writes Adresse.slots }
+    costs <= 12 ops
+{
+    Adresse.slots[0].byte = 16;
+    Adresse.slots[1].byte = 0;
+    Adresse.slots[2].byte = 0;
+    Adresse.slots[3].byte = 0;
+    Adresse.slots[4].byte = 0;
+    Adresse.slots[5].byte = 0;
+    Adresse.slots[6].byte = 0;
+    Adresse.slots[7].byte = 0;
+    Adresse.slots[8].byte = 0;
+    Adresse.slots[9].byte = 0;
+    Adresse.slots[10].byte = 0;
+    Adresse.slots[11].byte = 0;
     return;
 }
 
@@ -273,6 +307,12 @@ pub impl fn gib_typ() -> u32 in 0 .. 65535
 -- (4 header + 4 command payload) = 28 bytes. The queue number travels as
 -- res_id (big-endian: swapped, then low-byte-first); the command payload is
 -- command 1, pad, pf 0.
+-- Flags (lane bm11): NLM_F_REQUEST|NLM_F_ACK (5). Config sends are
+-- once-per-process, and `einrichten` reads every answer -- without ACK the
+-- kernel stays silent on success and the fourth `empfange` would block
+-- forever on a machine with rights. Verdicts (`baue_urteil` below) keep
+-- REQUEST alone: an ACK per verdict would flood the receive path with
+-- foreign-type datagrams.
 pub impl fn baue_binden(reihung : u32 in 0 .. 65535) -> u32 in 0 .. 64
     effects { reads Senden, writes Senden.slots }
     costs <= 56 ops
@@ -284,7 +324,7 @@ pub impl fn baue_binden(reihung : u32 in 0 .. 65535) -> u32 in 0 .. 64
     Senden.slots[3].byte = 0;
     Senden.slots[4].byte = 2;
     Senden.slots[5].byte = 3;
-    Senden.slots[6].byte = 1;
+    Senden.slots[6].byte = 5;
     Senden.slots[7].byte = 0;
     Senden.slots[8].byte = 0;
     Senden.slots[9].byte = 0;
@@ -324,7 +364,7 @@ pub impl fn baue_werte(reihung : u32 in 0 .. 65535, bereich : u32, modus : Einze
     Senden.slots[3].byte = 0;
     Senden.slots[4].byte = 2;
     Senden.slots[5].byte = 3;
-    Senden.slots[6].byte = 1;
+    Senden.slots[6].byte = 5;
     Senden.slots[7].byte = 0;
     Senden.slots[8].byte = 0;
     Senden.slots[9].byte = 0;
@@ -366,7 +406,7 @@ pub impl fn baue_wartelang(reihung : u32 in 0 .. 65535, maximum : u32) -> u32 in
     Senden.slots[3].byte = 0;
     Senden.slots[4].byte = 2;
     Senden.slots[5].byte = 3;
-    Senden.slots[6].byte = 1;
+    Senden.slots[6].byte = 5;
     Senden.slots[7].byte = 0;
     Senden.slots[8].byte = 0;
     Senden.slots[9].byte = 0;
@@ -406,7 +446,7 @@ pub impl fn baue_merkmale(reihung : u32 in 0 .. 65535, maske : u32, merkmale : u
     Senden.slots[3].byte = 0;
     Senden.slots[4].byte = 2;
     Senden.slots[5].byte = 3;
-    Senden.slots[6].byte = 1;
+    Senden.slots[6].byte = 5;
     Senden.slots[7].byte = 0;
     Senden.slots[8].byte = 0;
     Senden.slots[9].byte = 0;
@@ -640,6 +680,159 @@ pub impl fn suche_paket(meldung : u32 in 0 .. 8192) -> Zustand
     Ergebnis.slots[0].reihung = reihung;
     Ergebnis.slots[0].haken = haken;
     Ergebnis.slots[0].typ = typ;
+    return 0;
+}
+
+-- Border mirrors (lane bm11). Each line mirrors one `pub` transport wrapper
+-- of gab/systemrufe.gab with the C-identical parameter list: `ptr` over a
+-- table lowers to `Table *` on both sides, so the owner's memory travels by
+-- type, not by number (M140). The tables named here are OWN (`Senden`,
+-- `Empfang`, `Adresse`) -- no `use`, single-file green. TRUE effects and
+-- the owners' measured costs (the bm9 convention: claims, refuted at the C
+-- prototype diff and the link, never by proof from one file).
+extern fn netz_binden2(fd : u64, adresse : ptr<normal, r> Adresse) -> u64
+    effects { reads Adresse.slots } costs <= 14 ops;
+extern fn netz_senden2(fd : u64, nachricht : ptr<normal, r> Senden, laenge : u64) -> u64
+    effects { reads Senden.slots } costs <= 15 ops;
+extern fn netz_empfangen2(fd : u64, puffer : ptr<normal, rw> Empfang, laenge : u64) -> u64
+    effects { writes Empfang.slots } costs <= 15 ops;
+
+-- Bind this worker's socket to its own address (lane bm11): fill the
+-- twelve `sockaddr_nl` bytes, hand `&Adresse` to the kernel. Answers the
+-- raw answer: 0 bound, else a sentinel for the operator.
+pub impl fn verbinde(steckdose : u64) -> u64
+    effects { reads Adresse, writes Adresse.slots }
+    costs <= 41 ops
+{
+    lege_adresse();
+    let v : u64 = netz_binden2(steckdose, &Adresse);
+    return v;
+}
+
+-- Send the `Senden` bytes the builders left (`laenge` of them) on the
+-- worker's socket. Answers the raw answer: a byte count, or a sentinel.
+pub impl fn sende(steckdose : u64, laenge : u64) -> u64
+    effects { reads Senden.slots }
+    costs <= 19 ops
+{
+    let v : u64 = netz_senden2(steckdose, &Senden, laenge);
+    return v;
+}
+
+-- Receive one netlink datagram straight into `Empfang` (lane bm11): the
+-- kernel writes the owner's memory through the pointer -- no mapped
+-- buffer, no byte copy, no `lege_empfang` fill from driver code. Answers
+-- the raw answer: a byte count for `suche_paket`, or a sentinel
+-- (NOCHMAL/PAKETE_VERLOREN/KEIN_WERT -- the driver's contract).
+pub impl fn empfange(steckdose : u64, laenge : u64) -> u64
+    effects { writes Empfang.slots }
+    costs <= 19 ops
+{
+    let v : u64 = netz_empfangen2(steckdose, &Empfang, laenge);
+    return v;
+}
+
+-- Check one netlink acknowledgement in Empfang (lane bm11): the kernel
+-- answers every config send of `einrichten` with NLMSG_ERROR (type 2)
+-- carrying the negated errno -- 0 for acceptance, EPERM and friends
+-- otherwise. Answers 1 for ACK, 0 for everything else (short message,
+-- foreign type, nonzero error -- refuse, never interpret, same discipline
+-- as `suche_paket`). The replies arrive in send order on the worker's own
+-- socket, so `einrichten` consumes exactly four.
+pub impl fn pruefe_quittung(meldung : u32 in 0 .. 8192) -> u32 in 0 .. 1
+    effects { reads Empfang, reads Empfang.slots }
+    costs <= 34 ops
+{
+    if meldung < 20 {
+        return 0;
+    }
+    let y0 : Einzelbyte = Empfang.slots[4].byte;
+    let y1 : Einzelbyte = Empfang.slots[5].byte;
+    let typ : u32 in 0 .. 65535 = y0 + y1 * 256;
+    if typ != 2 {
+        return 0;
+    }
+    let e0 : Einzelbyte = Empfang.slots[16].byte;
+    let e1 : Einzelbyte = Empfang.slots[17].byte;
+    let e2 : Einzelbyte = Empfang.slots[18].byte;
+    let e3 : Einzelbyte = Empfang.slots[19].byte;
+    let fehler : u32 = e0 + e1 * 256 + e2 * 65536 + e3 * 16777216;
+    if fehler != 0 {
+        return 0;
+    }
+    return 1;
+}
+
+-- Configure queue 0 on the worker's socket, once per process (lane bm11):
+-- bind the address, then bind queue 0, copy mode packet/1600, depth 1024,
+-- fail-open flags -- each built into `Senden` and sent before the next
+-- build overwrites it. Then read the four answers: only four ACKs mean
+-- configured (see `pruefe_quittung`). Single attempt per step
+-- (configuration is once-per-process; the operator restarts on failure --
+-- fail closed, the queue stays unbound and delivers nothing). Answers 0
+-- when every send left with its built length AND every answer ACKed, else
+-- 1 -- the detail stays inside (same philosophy as the border's KEIN_WERT);
+-- the operator learns failed-vs-ok from the exit status.
+pub impl fn einrichten(steckdose : u64) -> u64
+    effects { reads Adresse, writes Adresse.slots, reads Senden, writes Senden.slots, reads Empfang, reads Empfang.slots, writes Empfang.slots }
+    costs <= 829 ops
+{
+    let b0 : u64 = verbinde(steckdose);
+    if b0 != 0 {
+        return 1;
+    }
+    let l1 : u32 in 0 .. 64 = baue_binden(0);
+    let s1 : u64 = sende(steckdose, l1);
+    if s1 != l1 {
+        return 1;
+    }
+    let l2 : u32 in 0 .. 64 = baue_werte(0, KOPIE_BREITE, KOPIE_PAKET);
+    let s2 : u64 = sende(steckdose, l2);
+    if s2 != l2 {
+        return 1;
+    }
+    let l3 : u32 in 0 .. 64 = baue_wartelang(0, WARTESCHLANGE);
+    let s3 : u64 = sende(steckdose, l3);
+    if s3 != l3 {
+        return 1;
+    }
+    let l4 : u32 in 0 .. 64 = baue_merkmale(0, MERKMAL_OFFEN, MERKMAL_OFFEN);
+    let s4 : u64 = sende(steckdose, l4);
+    if s4 != l4 {
+        return 1;
+    }
+    let a1 : u64 = empfange(steckdose, 8192);
+    narrow a1 to 0 .. 8192 else {
+        return 1;
+    }
+    let m1 : u32 in 0 .. 8192 = u32(a1);
+    if pruefe_quittung(m1) != 1 {
+        return 1;
+    }
+    let a2 : u64 = empfange(steckdose, 8192);
+    narrow a2 to 0 .. 8192 else {
+        return 1;
+    }
+    let m2 : u32 in 0 .. 8192 = u32(a2);
+    if pruefe_quittung(m2) != 1 {
+        return 1;
+    }
+    let a3 : u64 = empfange(steckdose, 8192);
+    narrow a3 to 0 .. 8192 else {
+        return 1;
+    }
+    let m3 : u32 in 0 .. 8192 = u32(a3);
+    if pruefe_quittung(m3) != 1 {
+        return 1;
+    }
+    let a4 : u64 = empfange(steckdose, 8192);
+    narrow a4 to 0 .. 8192 else {
+        return 1;
+    }
+    let m4 : u32 in 0 .. 8192 = u32(a4);
+    if pruefe_quittung(m4) != 1 {
+        return 1;
+    }
     return 0;
 }
 

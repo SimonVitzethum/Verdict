@@ -16,7 +16,7 @@
 -- either all eight zeroed in `ungueltig`, or all eight decoded at the single
 -- exit of `entpacke`. No field is ever written twice on one path.
 
-module brandmauer::pakete {
+module verdict::pakete {
 
 pub table Paket count 1600 {
     slot {
@@ -215,6 +215,19 @@ pub impl fn gib_kopf_laenge() -> u32 in 0 .. 65535
     costs <= 4 ops
 {
     return Kopf.slots[0].laenge;
+}
+
+-- One payload byte into the packet buffer (lane bm10). The driver lane
+-- (`gab/lauf.gab`) moves the netlink payload out of `netzverbindung`'s
+-- `Empfang` byte by byte (`hole_nutzlast`) and lands each byte here; the
+-- decision then reads it through `entpacke`. Same shape as `lege_empfang`
+-- in gab/netzverbindung.gab, mirrored side.
+pub impl fn setze_paket(i : index into Paket, w : u32 in 0 .. 255)
+    effects { writes Paket.slots }
+    costs <= 4 ops
+{
+    Paket.slots[i].byte = w;
+    return;
 }
 
 }

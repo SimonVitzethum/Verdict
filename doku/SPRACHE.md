@@ -979,7 +979,9 @@ program that writes its clauses.
 arithmetic operation, load, store; a call counts the declared `costs` of the callee; a traversal
 counts body costs × domain bound; branches count the maximum). That is a **property of the
 program** (D10), computed statically, not a time measurement — and it is the quantity in which
-`per_pass`, `held` and `bounded` speak. There are no cycles in the language.
+`per_pass`, `held` and `bounded` speak. There are no cycles in the language. A call through a
+`syscall` counts its declared `costs` on top of the dispatch step (`1 + fa`, never zero); without
+a countable promise the declaration is refused (`N322`).
 
 > **Two sharpenings, both fallen due on 2026-08-14 while building pass 9 — and both are statements
 > about the MODEL, not about the checker:**

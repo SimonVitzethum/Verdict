@@ -47,6 +47,27 @@ so both directions of a flow hash to the same bucket, plus a direction bit carri
 | `gab/systemrufe.gab` | every `syscall` declaration: socket, bind, sendto, recvfrom, mmap, clone, futex, exit_group, clock_gettime | the modules above |
 | `gab/netzverbindung.gab` | the netlink/NFQUEUE protocol: config messages, parsing a packet out of a netlink message, building the verdict message | the modules above |
 | `gab/lauf.gab` | `main`, the buffers, the worker threads via `clone`, the receive loop, the rule file | the internals of any of them |
+| `gab/sperre.gab` | the lock primitive: `VSPERRE_NEXT`/`VSPERRE_NOW` and `VSPERRE_nimm`/`VSPERRE_gib` (ticket lock) | everything (standalone file, no lock declaration inside) |
+
+**Lane bm11 amendments** (no shape above changed):
+
+- **Transports ride on pointers.** The `u64`-address syscalls stay for
+  what the kernel hands back (`mmap`, raw shapes). `bind`/`sendto`/
+  `recvfrom` additionally exist as `ptr` variants (`roh_binden2` etc. in
+  `gab/systemrufe.gab`), naming `gab/netzverbindung.gab`'s tables through
+  `use` (checked single-file with the generated `bau/netz.gabi` --
+  Makefile). The pointer is always a parameter from the owning module;
+  `gab/systemrufe.gab`'s TU-local copies are never referenced. File
+  descriptors, counts and lengths still cross every boundary as values.
+- **The lock implementation lives apart from the lock.** `N042` refuses a
+  bodied `VSPERRE_nimm` beside `lock VSPERRE` in one unit, so
+  `gab/sperre.gab` holds the bodies and no lock declaration; per-file emit
+  plus the C link resolve the pair. The bodies follow
+  `laufzeit/sperre.gab` shape for shape (N323 cannot see split files --
+  residue named in `messung/BEFUNDE-bm11.md`).
+- **Config asks, verdicts do not.** The four config builders set
+  `NLM_F_REQUEST|NLM_F_ACK` so `einrichten` reads four ACKs; `baue_urteil`
+  keeps REQUEST alone (an ACK per verdict would flood the receive path).
 
 ## There is no C. The border is the kernel ABI.
 

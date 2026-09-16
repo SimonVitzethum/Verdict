@@ -19,7 +19,7 @@
 --   verdraengen; Abweisen schuetzt sie. Der Treiber faellt auf die Regeln
 --   zurueck (Vorgabe: DROP), also fail-closed.
 
-module brandmauer::verbindungen {
+module verdict::verbindungen {
 
 -- Masse. Alle `pub`, weil die oeffentlichen Signaturen sie nennen (N038).
 pub const ANZAHL : u32 = 4096;
@@ -220,6 +220,88 @@ pub impl fn suche_oder_lege_an(quelle : u32, ziel : u32,
         Stand.slots[0].neu += 1;
     }
     return 1;
+}
+
+-- Nur suchen, nie anlegen, nie pflegen (E2c, lane bm10). Antwortet den
+-- Zustand wie suche_oder_lege_an ihn melden wuerde (0 frei/unbekannt,
+-- 1 NEU, 2 BESTEHEND, 3 SCHLIESSEND), schreibt aber nichts: kein
+-- treffer_pflegen, kein Stand-Zaehler, kein Eintrag. Die Entscheidung
+-- (gab/entscheidung.gab) ruft dies VOR dem Urteil und legt erst nach
+-- einem NIMM_AN durch suche_oder_lege_an an bzw. pflegt -- ein
+-- verworfener oder abgewiesener Paketzug bewegt die Tabelle nicht mehr.
+-- Kanonik und Hash stehen hier Zeile fuer Zeile wie dort; aendert sich
+-- die eine, folgt die andere.
+pub impl fn suche_nur(quelle : u32, ziel : u32,
+                      qport : u32 in 0 .. 65535,
+                      zport : u32 in 0 .. 65535,
+                      iprot : u32 in 0 .. 255) -> u32 in 0 .. 3
+    requires Held(VSPERRE)
+    effects { reads Verbindung.slots, locks VSPERRE }
+    costs <= 256 ops
+{
+    -- Kanonik: das kleinere (Adresse, Port)-Paar vorn (wie oben).
+    let mut a : u32 = quelle;
+    let mut b : u32 = ziel;
+    let mut pa : u32 in 0 .. 65535 = qport;
+    let mut pb : u32 in 0 .. 65535 = zport;
+    if quelle > ziel {
+        a = ziel;
+        b = quelle;
+        pa = zport;
+        pb = qport;
+    } else {
+        if quelle == ziel {
+            if qport > zport {
+                a = ziel;
+                b = quelle;
+                pa = zport;
+                pb = qport;
+            }
+        }
+    }
+    let h : u32 = a ^ b ^ pa ^ pb ^ iprot;
+    let eimer : u32 = h % EIMER;
+
+    -- Fach 0.
+    let s0 : u32 = eimer * 4 + 0;
+    narrow s0 to 0 ..< ANZAHL else { return 0; }
+    if Verbindung.slots[s0].zustand != 0 {
+        if Verbindung.slots[s0].adr_a == a && Verbindung.slots[s0].adr_b == b && Verbindung.slots[s0].port_a == pa && Verbindung.slots[s0].port_b == pb && Verbindung.slots[s0].iprot == iprot {
+            return Verbindung.slots[s0].zustand;
+        }
+    }
+
+    -- Fach 1.
+    let s1 : u32 = eimer * 4 + 1;
+    narrow s1 to 0 ..< ANZAHL else { return 0; }
+    if Verbindung.slots[s1].zustand != 0 {
+        if Verbindung.slots[s1].adr_a == a && Verbindung.slots[s1].adr_b == b && Verbindung.slots[s1].port_a == pa && Verbindung.slots[s1].port_b == pb && Verbindung.slots[s1].iprot == iprot {
+            return Verbindung.slots[s1].zustand;
+        }
+    }
+
+    -- Fach 2.
+    let s2 : u32 = eimer * 4 + 2;
+    narrow s2 to 0 ..< ANZAHL else { return 0; }
+    if Verbindung.slots[s2].zustand != 0 {
+        if Verbindung.slots[s2].adr_a == a && Verbindung.slots[s2].adr_b == b && Verbindung.slots[s2].port_a == pa && Verbindung.slots[s2].port_b == pb && Verbindung.slots[s2].iprot == iprot {
+            return Verbindung.slots[s2].zustand;
+        }
+    }
+
+    -- Fach 3.
+    let s3 : u32 = eimer * 4 + 3;
+    narrow s3 to 0 ..< ANZAHL else { return 0; }
+    if Verbindung.slots[s3].zustand != 0 {
+        if Verbindung.slots[s3].adr_a == a && Verbindung.slots[s3].adr_b == b && Verbindung.slots[s3].port_a == pa && Verbindung.slots[s3].port_b == pb && Verbindung.slots[s3].iprot == iprot {
+            return Verbindung.slots[s3].zustand;
+        }
+    }
+
+    -- Kein Treffer: 0, wie ein voller Eimer es melden wuerde -- der
+    -- Unterschied (unbekannt vs. voll) entscheidet sich erst beim
+    -- Anlegen nach NIMM_AN.
+    return 0;
 }
 
 -- Eintraege austragen, die aelter als ABLAUF sind. Wer die Uhr zurueckdreht

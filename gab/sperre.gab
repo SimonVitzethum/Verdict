@@ -1,0 +1,76 @@
+-- gab/sperre.gab -- lane bm11: the lock primitive, written in Gabbro.
+--
+-- `VSPERRE_nimm`/`VSPERRE_gib` are the acquire/release calls every `locks
+-- VSPERRE` block lowers to -- and a `lock` declaration emits them as imports,
+-- never as bodies. Defining them beside the lock is refused (N042, and the
+-- body would owe the lock contract N323 on top). So they stand HERE, in a
+-- file with no lock declaration: per-file emit plus the C link resolve the
+-- pair, and no checker ever sees both (measured: this file checks alone,
+-- the firewall links as units). The residue is named, not hidden: N323
+-- cannot see split files, so the contract holds BY SHAPE -- this file is
+-- the `VSPERRE` instance of `laufzeit/sperre.gab` (fetch-add ticket,
+-- acquire spin on the served ticket, wrapping `folge`, `publishes nothing`
+-- at the stores), whose algorithm `grammatik/Grammatik/CTicket.lean` proves.
+-- Where this shape deviates from that reference, the deviation is the bug.
+--
+-- The watchdog is `lauf_aufgegeben` (the driver's diverging exit, extern
+-- like the other four): a ticket-spin overrun is a driver fault, and on one
+-- worker (K-1, no contention) it is unreachable -- the spin ends at the
+-- served ticket after finitely many passes. No new stub symbol.
+--
+-- Costs follow the reference: `nimm` promises the 32-bit wrap bound,
+-- `gib` one load plus one wrapping store.
+
+module verdict::sperre {
+
+-- The ticket dispenser for VSPERRE. Drawn with fetch-add, so `relaxed`:
+-- drawing takes no synchronisation, only a distinct number.
+pub atomic VSPERRE_NEXT : u32 relaxed;
+
+-- The ticket now served. Spun on with `acquire` (entering the critical
+-- section synchronises with the releaser), advanced with `release`.
+pub atomic VSPERRE_NOW : u32 acquire;
+
+-- The driver's diverging exit, doubling as the ticket watchdog (see the
+-- file head). Extern, like the other four -- the stub provides it.
+extern fn lauf_aufgegeben() -> never effects { diverges };
+
+-- Wrapping successor on a 32-bit word. A parameter (not a `let` local
+-- and not an `exchange` binder) is what the emitter reads the exact range
+-- off -- the reference file's measured shape, kept byte for byte.
+impl fn folge(x : u32) -> u32
+    effects { pure }
+    costs <= 2 ops
+{
+    return x +% 1;
+}
+
+-- `VSPERRE_nimm`: draw a ticket, spin until it is served.
+pub impl fn VSPERRE_nimm()
+    effects { reads VSPERRE_NEXT, writes VSPERRE_NEXT, reads VSPERRE_NOW }
+    costs <= 4294967299 ops
+{
+    let my : u32 = VSPERRE_NEXT exchange update(t)
+        bounded 64 ops
+        on_exceeded lauf_aufgegeben
+    { return folge(t); } publishes nothing;
+    retry spin until VSPERRE_NOW == my
+        bounded 4294967295 ops
+        on_exceeded lauf_aufgegeben
+        effects { reads VSPERRE_NOW }
+    {
+    }
+    return;
+}
+
+-- `VSPERRE_gib`: serve the next ticket. One load, one wrapping store.
+pub impl fn VSPERRE_gib()
+    effects { reads VSPERRE_NOW, writes VSPERRE_NOW }
+    costs <= 64 ops
+{
+    let n : u32 = VSPERRE_NOW;
+    VSPERRE_NOW = folge(n) publishes nothing;
+    return;
+}
+
+}

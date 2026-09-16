@@ -53,20 +53,24 @@
 --      key rule (smaller (address, port) first). It MUST match
 --      `suche_oder_lege_an` line for line; if that canonicalization ever
 --      changes, this gate follows it.
---   3. look the flow up (`suche_oder_lege_an`) with the decoded tuple and
---      the current time, under `VSPERRE` -- the only statements inside the
---      `locks` block are the lookup and its assignment, so the critical
---      section is exactly one table operation.
---   4. fast path, REPAIRED (lane bm8 F5 -- see below): ACCEPT without
---      walking the rules only for a FORWARD packet answering ESTABLISHED.
+--   3. look the flow up READ-ONLY (`suche_nur`, lane bm10 E2c) with the
+--      decoded tuple, under `VSPERRE` -- the only statements inside the
+--      `locks` block are the lookup and its assignment. No create, no
+--      promotion, no counter: a packet this path drops moves nothing.
+--   4. fast path (F5 + E2c): ACCEPT without walking the rules only for a
+--      FORWARD packet on a flow that was ESTABLISHED before this packet.
+--      The refresh runs through `suche_oder_lege_an` -- gated by the
+--      ACCEPT just counted, so the table moves only for accepted packets.
 --   5. otherwise walk the rules (`entscheide_regeln`); the default policy
 --      (`STANDARD`, DROP -- owned by regeln.gab, not repeated here)
---      decides when nothing matches. A refused lookup (state 0: the
---      bucket was full) also lands here -- fail closed -- after surfacing
---      the event through `zaehle_voll`.
+--      decides when nothing matches.
 --   6. count the verdict (`zaehle_urteil`, exactly once per call, so
 --      GESAMT == VERWORFEN + AKZEPTIERT + ABGEWIESEN holds by construction)
 --      and, when a rule matched, the rule hit (`zaehle_regel`).
+--   7. verdict gating (E2c): ONLY NIMM_AN confirms the flow
+--      (`suche_oder_lege_an`: create or promote). A refused confirm
+--      (bucket full, answer 0) surfaces through `zaehle_voll`; the
+--      verdict stands.
 --
 -- THE F5 REPAIR, in one paragraph. `suche_oder_lege_an` answers the
 -- POST-transition state, so the packet promoting NEW -> ESTABLISHED answers
@@ -77,10 +81,20 @@
 -- 1 -- read `treffer_pflegen` in gab/verbindungen.gab), so only that shape
 -- takes the fast path. A reverse packet answering 2 may be the promotion
 -- itself and always walks the rules. Price, stated: reverse traffic on an
--- established flow pays a rule walk (fail-closed direction); the promotion
--- side effect itself (a DROPPed packet still moves the table) is NOT undone
--- here -- undoing it wants a verdict-gated lookup, i.e. a verbindungen.gab
--- signature change, which is another lane's file (see BERICHT-bm9.md).
+-- established flow pays a rule walk (fail-closed direction).
+--
+-- THE E2C REPAIR, in one paragraph (lane bm10). F5 left the side effect:
+-- the pre-verdict lookup promoted on DROP, so the E2b DROP still moved the
+-- flow to ESTABLISHED and E2c (same frame again) fast-pathed on a flow that
+-- never saw an ACCEPT. The repair splits the lookup: `suche_nur` (no write
+-- of any kind) runs before the verdict, `suche_oder_lege_an` runs only
+-- after NIMM_AN -- on the fast path and after the rules alike. A DROPPed
+-- or abgewiesener packet performs zero writes to Verbindung and Stand;
+-- E2b ends DROPped with the table unchanged, E2c walks the rules again.
+-- Price, stated: two lock acquisitions per accepted packet (read, then
+-- confirm); a confirm refused by a full bucket keeps the ACCEPT verdict
+-- (rules decided) and surfaces through `zaehle_voll` -- that flow's every
+-- packet walks the rules, stateless fallback.
 --
 -- WHAT THIS FILE STILL CANNOT DO (each with its reason in
 -- messung/BEFUNDE-bm9.md unless named here):
@@ -96,32 +110,32 @@
 -- (0 frei, 1 NEU, 2 BESTEHEND, 3 SCHLIESSEND), KEIN_TREFFER marks "no rule
 -- matched -- the default policy decided" for the counters.
 
-module brandmauer::entscheidung {
+module verdict::entscheidung {
 
 -- pakete.gab mirrors (lane bm9 accessors, gab/pakete.gab). Only the six
 -- fields the decision reads; `gueltig` arrives as `entpacke`'s answer and
 -- `laenge` never reaches the verdict. Ranges repeat the Kopf declaration.
 extern fn entpacke(laenge : u32 in 0 .. 1600) -> u32 in 0 .. 1
-    effects { reads Paket.slots, writes Kopf.slots };
+    effects { reads Paket.slots, writes Kopf.slots } costs <= 200 ops;
 extern fn gib_kopf_proto() -> u32 in 0 .. 255
-    effects { reads Kopf, reads Kopf.slots };
+    effects { reads Kopf, reads Kopf.slots } costs <= 4 ops;
 extern fn gib_kopf_quelle() -> u32
-    effects { reads Kopf, reads Kopf.slots };
+    effects { reads Kopf, reads Kopf.slots } costs <= 4 ops;
 extern fn gib_kopf_ziel() -> u32
-    effects { reads Kopf, reads Kopf.slots };
+    effects { reads Kopf, reads Kopf.slots } costs <= 4 ops;
 extern fn gib_kopf_qport() -> u32 in 0 .. 65535
-    effects { reads Kopf, reads Kopf.slots };
+    effects { reads Kopf, reads Kopf.slots } costs <= 4 ops;
 extern fn gib_kopf_zport() -> u32 in 0 .. 65535
-    effects { reads Kopf, reads Kopf.slots };
+    effects { reads Kopf, reads Kopf.slots } costs <= 4 ops;
 extern fn gib_kopf_flaggen() -> u32 in 0 .. 255
-    effects { reads Kopf, reads Kopf.slots };
+    effects { reads Kopf, reads Kopf.slots } costs <= 4 ops;
 
 -- regeln.gab mirrors. `r` travels as plain `u32` (see the file head):
 -- the C is `uint32_t`, the Gabbro index proof is the caller's guard.
 extern fn passt(r : u32, proto : u32 in 0 .. 255, quelle : u32, ziel : u32, qport : u32 in 0 .. 65535, zport : u32 in 0 .. 65535, flaggen : u32 in 0 .. 255) -> u32 in 0 .. 1
-    effects { reads Regel, reads Regel.slots };
+    effects { reads Regel, reads Regel.slots } costs <= 71 ops;
 extern fn entscheide_regeln(proto : u32 in 0 .. 255, quelle : u32, ziel : u32, qport : u32 in 0 .. 65535, zport : u32 in 0 .. 65535, flaggen : u32 in 0 .. 255) -> u32 in 0 .. 2
-    effects { reads Regel, reads Regel.slots };
+    effects { reads Regel, reads Regel.slots } costs <= 68096 ops;
 
 -- verbindungen.gab mirrors. Same name, rank and held bound as the owner;
 -- checker scaffolding emitting the same call names (see the file head).
@@ -129,18 +143,25 @@ pub lock VSPERRE protects { Verbindung, Stand } rank 0 held <= 1024 ops;
 
 extern fn suche_oder_lege_an(quelle : u32, ziel : u32, qport : u32 in 0 .. 65535, zport : u32 in 0 .. 65535, iprot : u32 in 0 .. 255, flaggen : u32 in 0 .. 255, jetzt : u32) -> u32 in 0 .. 3
     requires Held(VSPERRE)
-    effects { reads Verbindung.slots, writes Verbindung.slots, reads Stand.slots, writes Stand.slots, locks VSPERRE };
+    effects { reads Verbindung.slots, writes Verbindung.slots, reads Stand.slots, writes Stand.slots, locks VSPERRE } costs <= 512 ops;
+
+-- E2c mirror (lane bm10): the read-only lookup. Same name, rank and
+-- footprint as the owner `suche_nur` in gab/verbindungen.gab; the call
+-- stands inside `locks VSPERRE`, so the set is exact (SG-20).
+extern fn suche_nur(quelle : u32, ziel : u32, qport : u32 in 0 .. 65535, zport : u32 in 0 .. 65535, iprot : u32 in 0 .. 255) -> u32 in 0 .. 3
+    requires Held(VSPERRE)
+    effects { reads Verbindung.slots, locks VSPERRE } costs <= 256 ops;
 
 -- zaehler.gab mirrors. The `zaehle_regel` footprint below is the owner's,
 -- entry for entry (256 per-rule atomics plus the sum).
 extern fn zaehle_urteil(u : u32 in 0 .. 2)
-    effects { reads VERWORFEN, writes VERWORFEN, reads AKZEPTIERT, writes AKZEPTIERT, reads ABGEWIESEN, writes ABGEWIESEN, reads GESAMT, writes GESAMT };
+    effects { reads VERWORFEN, writes VERWORFEN, reads AKZEPTIERT, writes AKZEPTIERT, reads ABGEWIESEN, writes ABGEWIESEN, reads GESAMT, writes GESAMT } costs <= 14 ops;
 extern fn zaehle_regel(r : u32 in 0 .. 255)
-    effects { reads REGEL000, writes REGEL000, reads REGEL001, writes REGEL001, reads REGEL002, writes REGEL002, reads REGEL003, writes REGEL003, reads REGEL004, writes REGEL004, reads REGEL005, writes REGEL005, reads REGEL006, writes REGEL006, reads REGEL007, writes REGEL007, reads REGEL008, writes REGEL008, reads REGEL009, writes REGEL009, reads REGEL010, writes REGEL010, reads REGEL011, writes REGEL011, reads REGEL012, writes REGEL012, reads REGEL013, writes REGEL013, reads REGEL014, writes REGEL014, reads REGEL015, writes REGEL015, reads REGEL016, writes REGEL016, reads REGEL017, writes REGEL017, reads REGEL018, writes REGEL018, reads REGEL019, writes REGEL019, reads REGEL020, writes REGEL020, reads REGEL021, writes REGEL021, reads REGEL022, writes REGEL022, reads REGEL023, writes REGEL023, reads REGEL024, writes REGEL024, reads REGEL025, writes REGEL025, reads REGEL026, writes REGEL026, reads REGEL027, writes REGEL027, reads REGEL028, writes REGEL028, reads REGEL029, writes REGEL029, reads REGEL030, writes REGEL030, reads REGEL031, writes REGEL031, reads REGEL032, writes REGEL032, reads REGEL033, writes REGEL033, reads REGEL034, writes REGEL034, reads REGEL035, writes REGEL035, reads REGEL036, writes REGEL036, reads REGEL037, writes REGEL037, reads REGEL038, writes REGEL038, reads REGEL039, writes REGEL039, reads REGEL040, writes REGEL040, reads REGEL041, writes REGEL041, reads REGEL042, writes REGEL042, reads REGEL043, writes REGEL043, reads REGEL044, writes REGEL044, reads REGEL045, writes REGEL045, reads REGEL046, writes REGEL046, reads REGEL047, writes REGEL047, reads REGEL048, writes REGEL048, reads REGEL049, writes REGEL049, reads REGEL050, writes REGEL050, reads REGEL051, writes REGEL051, reads REGEL052, writes REGEL052, reads REGEL053, writes REGEL053, reads REGEL054, writes REGEL054, reads REGEL055, writes REGEL055, reads REGEL056, writes REGEL056, reads REGEL057, writes REGEL057, reads REGEL058, writes REGEL058, reads REGEL059, writes REGEL059, reads REGEL060, writes REGEL060, reads REGEL061, writes REGEL061, reads REGEL062, writes REGEL062, reads REGEL063, writes REGEL063, reads REGEL064, writes REGEL064, reads REGEL065, writes REGEL065, reads REGEL066, writes REGEL066, reads REGEL067, writes REGEL067, reads REGEL068, writes REGEL068, reads REGEL069, writes REGEL069, reads REGEL070, writes REGEL070, reads REGEL071, writes REGEL071, reads REGEL072, writes REGEL072, reads REGEL073, writes REGEL073, reads REGEL074, writes REGEL074, reads REGEL075, writes REGEL075, reads REGEL076, writes REGEL076, reads REGEL077, writes REGEL077, reads REGEL078, writes REGEL078, reads REGEL079, writes REGEL079, reads REGEL080, writes REGEL080, reads REGEL081, writes REGEL081, reads REGEL082, writes REGEL082, reads REGEL083, writes REGEL083, reads REGEL084, writes REGEL084, reads REGEL085, writes REGEL085, reads REGEL086, writes REGEL086, reads REGEL087, writes REGEL087, reads REGEL088, writes REGEL088, reads REGEL089, writes REGEL089, reads REGEL090, writes REGEL090, reads REGEL091, writes REGEL091, reads REGEL092, writes REGEL092, reads REGEL093, writes REGEL093, reads REGEL094, writes REGEL094, reads REGEL095, writes REGEL095, reads REGEL096, writes REGEL096, reads REGEL097, writes REGEL097, reads REGEL098, writes REGEL098, reads REGEL099, writes REGEL099, reads REGEL100, writes REGEL100, reads REGEL101, writes REGEL101, reads REGEL102, writes REGEL102, reads REGEL103, writes REGEL103, reads REGEL104, writes REGEL104, reads REGEL105, writes REGEL105, reads REGEL106, writes REGEL106, reads REGEL107, writes REGEL107, reads REGEL108, writes REGEL108, reads REGEL109, writes REGEL109, reads REGEL110, writes REGEL110, reads REGEL111, writes REGEL111, reads REGEL112, writes REGEL112, reads REGEL113, writes REGEL113, reads REGEL114, writes REGEL114, reads REGEL115, writes REGEL115, reads REGEL116, writes REGEL116, reads REGEL117, writes REGEL117, reads REGEL118, writes REGEL118, reads REGEL119, writes REGEL119, reads REGEL120, writes REGEL120, reads REGEL121, writes REGEL121, reads REGEL122, writes REGEL122, reads REGEL123, writes REGEL123, reads REGEL124, writes REGEL124, reads REGEL125, writes REGEL125, reads REGEL126, writes REGEL126, reads REGEL127, writes REGEL127, reads REGEL128, writes REGEL128, reads REGEL129, writes REGEL129, reads REGEL130, writes REGEL130, reads REGEL131, writes REGEL131, reads REGEL132, writes REGEL132, reads REGEL133, writes REGEL133, reads REGEL134, writes REGEL134, reads REGEL135, writes REGEL135, reads REGEL136, writes REGEL136, reads REGEL137, writes REGEL137, reads REGEL138, writes REGEL138, reads REGEL139, writes REGEL139, reads REGEL140, writes REGEL140, reads REGEL141, writes REGEL141, reads REGEL142, writes REGEL142, reads REGEL143, writes REGEL143, reads REGEL144, writes REGEL144, reads REGEL145, writes REGEL145, reads REGEL146, writes REGEL146, reads REGEL147, writes REGEL147, reads REGEL148, writes REGEL148, reads REGEL149, writes REGEL149, reads REGEL150, writes REGEL150, reads REGEL151, writes REGEL151, reads REGEL152, writes REGEL152, reads REGEL153, writes REGEL153, reads REGEL154, writes REGEL154, reads REGEL155, writes REGEL155, reads REGEL156, writes REGEL156, reads REGEL157, writes REGEL157, reads REGEL158, writes REGEL158, reads REGEL159, writes REGEL159, reads REGEL160, writes REGEL160, reads REGEL161, writes REGEL161, reads REGEL162, writes REGEL162, reads REGEL163, writes REGEL163, reads REGEL164, writes REGEL164, reads REGEL165, writes REGEL165, reads REGEL166, writes REGEL166, reads REGEL167, writes REGEL167, reads REGEL168, writes REGEL168, reads REGEL169, writes REGEL169, reads REGEL170, writes REGEL170, reads REGEL171, writes REGEL171, reads REGEL172, writes REGEL172, reads REGEL173, writes REGEL173, reads REGEL174, writes REGEL174, reads REGEL175, writes REGEL175, reads REGEL176, writes REGEL176, reads REGEL177, writes REGEL177, reads REGEL178, writes REGEL178, reads REGEL179, writes REGEL179, reads REGEL180, writes REGEL180, reads REGEL181, writes REGEL181, reads REGEL182, writes REGEL182, reads REGEL183, writes REGEL183, reads REGEL184, writes REGEL184, reads REGEL185, writes REGEL185, reads REGEL186, writes REGEL186, reads REGEL187, writes REGEL187, reads REGEL188, writes REGEL188, reads REGEL189, writes REGEL189, reads REGEL190, writes REGEL190, reads REGEL191, writes REGEL191, reads REGEL192, writes REGEL192, reads REGEL193, writes REGEL193, reads REGEL194, writes REGEL194, reads REGEL195, writes REGEL195, reads REGEL196, writes REGEL196, reads REGEL197, writes REGEL197, reads REGEL198, writes REGEL198, reads REGEL199, writes REGEL199, reads REGEL200, writes REGEL200, reads REGEL201, writes REGEL201, reads REGEL202, writes REGEL202, reads REGEL203, writes REGEL203, reads REGEL204, writes REGEL204, reads REGEL205, writes REGEL205, reads REGEL206, writes REGEL206, reads REGEL207, writes REGEL207, reads REGEL208, writes REGEL208, reads REGEL209, writes REGEL209, reads REGEL210, writes REGEL210, reads REGEL211, writes REGEL211, reads REGEL212, writes REGEL212, reads REGEL213, writes REGEL213, reads REGEL214, writes REGEL214, reads REGEL215, writes REGEL215, reads REGEL216, writes REGEL216, reads REGEL217, writes REGEL217, reads REGEL218, writes REGEL218, reads REGEL219, writes REGEL219, reads REGEL220, writes REGEL220, reads REGEL221, writes REGEL221, reads REGEL222, writes REGEL222, reads REGEL223, writes REGEL223, reads REGEL224, writes REGEL224, reads REGEL225, writes REGEL225, reads REGEL226, writes REGEL226, reads REGEL227, writes REGEL227, reads REGEL228, writes REGEL228, reads REGEL229, writes REGEL229, reads REGEL230, writes REGEL230, reads REGEL231, writes REGEL231, reads REGEL232, writes REGEL232, reads REGEL233, writes REGEL233, reads REGEL234, writes REGEL234, reads REGEL235, writes REGEL235, reads REGEL236, writes REGEL236, reads REGEL237, writes REGEL237, reads REGEL238, writes REGEL238, reads REGEL239, writes REGEL239, reads REGEL240, writes REGEL240, reads REGEL241, writes REGEL241, reads REGEL242, writes REGEL242, reads REGEL243, writes REGEL243, reads REGEL244, writes REGEL244, reads REGEL245, writes REGEL245, reads REGEL246, writes REGEL246, reads REGEL247, writes REGEL247, reads REGEL248, writes REGEL248, reads REGEL249, writes REGEL249, reads REGEL250, writes REGEL250, reads REGEL251, writes REGEL251, reads REGEL252, writes REGEL252, reads REGEL253, writes REGEL253, reads REGEL254, writes REGEL254, reads REGEL255, writes REGEL255, reads REGELSUMME, writes REGELSUMME };
+    effects { reads REGEL000, writes REGEL000, reads REGEL001, writes REGEL001, reads REGEL002, writes REGEL002, reads REGEL003, writes REGEL003, reads REGEL004, writes REGEL004, reads REGEL005, writes REGEL005, reads REGEL006, writes REGEL006, reads REGEL007, writes REGEL007, reads REGEL008, writes REGEL008, reads REGEL009, writes REGEL009, reads REGEL010, writes REGEL010, reads REGEL011, writes REGEL011, reads REGEL012, writes REGEL012, reads REGEL013, writes REGEL013, reads REGEL014, writes REGEL014, reads REGEL015, writes REGEL015, reads REGEL016, writes REGEL016, reads REGEL017, writes REGEL017, reads REGEL018, writes REGEL018, reads REGEL019, writes REGEL019, reads REGEL020, writes REGEL020, reads REGEL021, writes REGEL021, reads REGEL022, writes REGEL022, reads REGEL023, writes REGEL023, reads REGEL024, writes REGEL024, reads REGEL025, writes REGEL025, reads REGEL026, writes REGEL026, reads REGEL027, writes REGEL027, reads REGEL028, writes REGEL028, reads REGEL029, writes REGEL029, reads REGEL030, writes REGEL030, reads REGEL031, writes REGEL031, reads REGEL032, writes REGEL032, reads REGEL033, writes REGEL033, reads REGEL034, writes REGEL034, reads REGEL035, writes REGEL035, reads REGEL036, writes REGEL036, reads REGEL037, writes REGEL037, reads REGEL038, writes REGEL038, reads REGEL039, writes REGEL039, reads REGEL040, writes REGEL040, reads REGEL041, writes REGEL041, reads REGEL042, writes REGEL042, reads REGEL043, writes REGEL043, reads REGEL044, writes REGEL044, reads REGEL045, writes REGEL045, reads REGEL046, writes REGEL046, reads REGEL047, writes REGEL047, reads REGEL048, writes REGEL048, reads REGEL049, writes REGEL049, reads REGEL050, writes REGEL050, reads REGEL051, writes REGEL051, reads REGEL052, writes REGEL052, reads REGEL053, writes REGEL053, reads REGEL054, writes REGEL054, reads REGEL055, writes REGEL055, reads REGEL056, writes REGEL056, reads REGEL057, writes REGEL057, reads REGEL058, writes REGEL058, reads REGEL059, writes REGEL059, reads REGEL060, writes REGEL060, reads REGEL061, writes REGEL061, reads REGEL062, writes REGEL062, reads REGEL063, writes REGEL063, reads REGEL064, writes REGEL064, reads REGEL065, writes REGEL065, reads REGEL066, writes REGEL066, reads REGEL067, writes REGEL067, reads REGEL068, writes REGEL068, reads REGEL069, writes REGEL069, reads REGEL070, writes REGEL070, reads REGEL071, writes REGEL071, reads REGEL072, writes REGEL072, reads REGEL073, writes REGEL073, reads REGEL074, writes REGEL074, reads REGEL075, writes REGEL075, reads REGEL076, writes REGEL076, reads REGEL077, writes REGEL077, reads REGEL078, writes REGEL078, reads REGEL079, writes REGEL079, reads REGEL080, writes REGEL080, reads REGEL081, writes REGEL081, reads REGEL082, writes REGEL082, reads REGEL083, writes REGEL083, reads REGEL084, writes REGEL084, reads REGEL085, writes REGEL085, reads REGEL086, writes REGEL086, reads REGEL087, writes REGEL087, reads REGEL088, writes REGEL088, reads REGEL089, writes REGEL089, reads REGEL090, writes REGEL090, reads REGEL091, writes REGEL091, reads REGEL092, writes REGEL092, reads REGEL093, writes REGEL093, reads REGEL094, writes REGEL094, reads REGEL095, writes REGEL095, reads REGEL096, writes REGEL096, reads REGEL097, writes REGEL097, reads REGEL098, writes REGEL098, reads REGEL099, writes REGEL099, reads REGEL100, writes REGEL100, reads REGEL101, writes REGEL101, reads REGEL102, writes REGEL102, reads REGEL103, writes REGEL103, reads REGEL104, writes REGEL104, reads REGEL105, writes REGEL105, reads REGEL106, writes REGEL106, reads REGEL107, writes REGEL107, reads REGEL108, writes REGEL108, reads REGEL109, writes REGEL109, reads REGEL110, writes REGEL110, reads REGEL111, writes REGEL111, reads REGEL112, writes REGEL112, reads REGEL113, writes REGEL113, reads REGEL114, writes REGEL114, reads REGEL115, writes REGEL115, reads REGEL116, writes REGEL116, reads REGEL117, writes REGEL117, reads REGEL118, writes REGEL118, reads REGEL119, writes REGEL119, reads REGEL120, writes REGEL120, reads REGEL121, writes REGEL121, reads REGEL122, writes REGEL122, reads REGEL123, writes REGEL123, reads REGEL124, writes REGEL124, reads REGEL125, writes REGEL125, reads REGEL126, writes REGEL126, reads REGEL127, writes REGEL127, reads REGEL128, writes REGEL128, reads REGEL129, writes REGEL129, reads REGEL130, writes REGEL130, reads REGEL131, writes REGEL131, reads REGEL132, writes REGEL132, reads REGEL133, writes REGEL133, reads REGEL134, writes REGEL134, reads REGEL135, writes REGEL135, reads REGEL136, writes REGEL136, reads REGEL137, writes REGEL137, reads REGEL138, writes REGEL138, reads REGEL139, writes REGEL139, reads REGEL140, writes REGEL140, reads REGEL141, writes REGEL141, reads REGEL142, writes REGEL142, reads REGEL143, writes REGEL143, reads REGEL144, writes REGEL144, reads REGEL145, writes REGEL145, reads REGEL146, writes REGEL146, reads REGEL147, writes REGEL147, reads REGEL148, writes REGEL148, reads REGEL149, writes REGEL149, reads REGEL150, writes REGEL150, reads REGEL151, writes REGEL151, reads REGEL152, writes REGEL152, reads REGEL153, writes REGEL153, reads REGEL154, writes REGEL154, reads REGEL155, writes REGEL155, reads REGEL156, writes REGEL156, reads REGEL157, writes REGEL157, reads REGEL158, writes REGEL158, reads REGEL159, writes REGEL159, reads REGEL160, writes REGEL160, reads REGEL161, writes REGEL161, reads REGEL162, writes REGEL162, reads REGEL163, writes REGEL163, reads REGEL164, writes REGEL164, reads REGEL165, writes REGEL165, reads REGEL166, writes REGEL166, reads REGEL167, writes REGEL167, reads REGEL168, writes REGEL168, reads REGEL169, writes REGEL169, reads REGEL170, writes REGEL170, reads REGEL171, writes REGEL171, reads REGEL172, writes REGEL172, reads REGEL173, writes REGEL173, reads REGEL174, writes REGEL174, reads REGEL175, writes REGEL175, reads REGEL176, writes REGEL176, reads REGEL177, writes REGEL177, reads REGEL178, writes REGEL178, reads REGEL179, writes REGEL179, reads REGEL180, writes REGEL180, reads REGEL181, writes REGEL181, reads REGEL182, writes REGEL182, reads REGEL183, writes REGEL183, reads REGEL184, writes REGEL184, reads REGEL185, writes REGEL185, reads REGEL186, writes REGEL186, reads REGEL187, writes REGEL187, reads REGEL188, writes REGEL188, reads REGEL189, writes REGEL189, reads REGEL190, writes REGEL190, reads REGEL191, writes REGEL191, reads REGEL192, writes REGEL192, reads REGEL193, writes REGEL193, reads REGEL194, writes REGEL194, reads REGEL195, writes REGEL195, reads REGEL196, writes REGEL196, reads REGEL197, writes REGEL197, reads REGEL198, writes REGEL198, reads REGEL199, writes REGEL199, reads REGEL200, writes REGEL200, reads REGEL201, writes REGEL201, reads REGEL202, writes REGEL202, reads REGEL203, writes REGEL203, reads REGEL204, writes REGEL204, reads REGEL205, writes REGEL205, reads REGEL206, writes REGEL206, reads REGEL207, writes REGEL207, reads REGEL208, writes REGEL208, reads REGEL209, writes REGEL209, reads REGEL210, writes REGEL210, reads REGEL211, writes REGEL211, reads REGEL212, writes REGEL212, reads REGEL213, writes REGEL213, reads REGEL214, writes REGEL214, reads REGEL215, writes REGEL215, reads REGEL216, writes REGEL216, reads REGEL217, writes REGEL217, reads REGEL218, writes REGEL218, reads REGEL219, writes REGEL219, reads REGEL220, writes REGEL220, reads REGEL221, writes REGEL221, reads REGEL222, writes REGEL222, reads REGEL223, writes REGEL223, reads REGEL224, writes REGEL224, reads REGEL225, writes REGEL225, reads REGEL226, writes REGEL226, reads REGEL227, writes REGEL227, reads REGEL228, writes REGEL228, reads REGEL229, writes REGEL229, reads REGEL230, writes REGEL230, reads REGEL231, writes REGEL231, reads REGEL232, writes REGEL232, reads REGEL233, writes REGEL233, reads REGEL234, writes REGEL234, reads REGEL235, writes REGEL235, reads REGEL236, writes REGEL236, reads REGEL237, writes REGEL237, reads REGEL238, writes REGEL238, reads REGEL239, writes REGEL239, reads REGEL240, writes REGEL240, reads REGEL241, writes REGEL241, reads REGEL242, writes REGEL242, reads REGEL243, writes REGEL243, reads REGEL244, writes REGEL244, reads REGEL245, writes REGEL245, reads REGEL246, writes REGEL246, reads REGEL247, writes REGEL247, reads REGEL248, writes REGEL248, reads REGEL249, writes REGEL249, reads REGEL250, writes REGEL250, reads REGEL251, writes REGEL251, reads REGEL252, writes REGEL252, reads REGEL253, writes REGEL253, reads REGEL254, writes REGEL254, reads REGEL255, writes REGEL255, reads REGELSUMME, writes REGELSUMME } costs <= 1797 ops;
 extern fn zaehle_fehl()
-    effects { reads FEHLFORM, writes FEHLFORM };
+    effects { reads FEHLFORM, writes FEHLFORM } costs <= 5 ops;
 extern fn zaehle_voll()
-    effects { reads VOLL, writes VOLL };
+    effects { reads VOLL, writes VOLL } costs <= 5 ops;
 
 const DROP : u32 in 0 .. 2 = 0;
 const NIMM_AN : u32 in 0 .. 2 = 1;
@@ -211,7 +232,7 @@ impl fn treffer_index(proto : u32 in 0 .. 255, quelle : u32, ziel : u32, qport :
     let mut k : u32 in 0 .. 256 = 0;
     let mut antwort : u32 in 0 .. 256 = KEIN_TREFFER;
     forever suche
-        per_pass bounded 64 ops
+        per_pass bounded 86 ops
         on_exceeded treffer_aufgegeben
         effects { reads Regel, reads Regel.slots }
         progress treffer_suche_endet
@@ -244,6 +265,7 @@ impl fn treffer_index(proto : u32 in 0 .. 255, quelle : u32, ziel : u32, qport :
 -- `extern` (K003).
 impl fn zaehle_weiter(u : u32 in 0 .. 2) -> u32 in 0 .. 2
     effects { reads VERWORFEN, writes VERWORFEN, reads AKZEPTIERT, writes AKZEPTIERT, reads ABGEWIESEN, writes ABGEWIESEN, reads GESAMT, writes GESAMT }
+    costs <= 16 ops
 {
     zaehle_urteil(u);
     return u;
@@ -299,36 +321,36 @@ pub impl fn entscheide(laenge : u32 in 0 .. 1600, faden : u32 in 0 .. 15) -> u32
             }
         }
     }
-    -- 3. Flow lookup under the connection lock. The block holds exactly
-    --    the lookup and its assignment: rule matching and counting stay
-    --    outside the critical section (the rule table is read-only after
-    --    startup, the counters are lock-free atomics).
+    -- 3. Flow lookup, READ-ONLY (E2c, lane bm10). `suche_nur` answers the
+    --    stored state and NOTHING else: no create, no promotion, no counter.
+    --    A packet this path DROPps or weist ab leaves the connection table
+    --    exactly as it found it. The block holds exactly the lookup and its
+    --    assignment: rule matching and counting stay outside the critical
+    --    section (the rule table is read-only after startup, the counters
+    --    are lock-free atomics).
     let jetzt : u32 = tick();
     let mut zustand : u32 in 0 .. 3 = FREI;
     locks VSPERRE {
-        zustand = suche_oder_lege_an(quelle, ziel, qport, zport, proto, flaggen, jetzt);
+        zustand = suche_nur(quelle, ziel, qport, zport, proto);
     }
-    -- 4. Fast path, repaired (F5). `zustand` is the POST-transition state:
-    --    the packet promoting NEW -> ESTABLISHED answers 2, exactly like a
-    --    packet on a long-established flow. The direction tells them apart:
-    --    a forward hit on NEW answers 1 and a fresh entry answers 1, so a
-    --    forward packet answering 2 was ESTABLISHED before this packet --
-    --    only that shape skips the rules. A reverse packet answering 2 may
-    --    be the promotion itself and always walks the rules below. The old
-    --    shape (`zustand == BESTEHEND` alone) ACCEPTed the promoting packet
-    --    unseen; the E2 recipe in BEFUNDE-bm8.md F5 (SYN to a dropped port,
-    --    then a spoofed reply) is the regression test.
+    -- 4. Fast path, repaired (F5) and gated (E2c). `zustand` is the stored
+    --    state, so a forward packet answering BESTEHEND was ESTABLISHED
+    --    before this packet -- only that shape skips the rules. The ACCEPT
+    --    still touches the table, and only because it IS an accept: the
+    --    refresh (timestamp, direction counters, treffer -- via
+    --    suche_oder_lege_an, which on an existing entry only pflegt)
+    --    runs gated by the verdict just counted.
     if zustand == BESTEHEND && richtung == 0 {
+        locks VSPERRE {
+            zustand = suche_oder_lege_an(quelle, ziel, qport, zport, proto, flaggen, jetzt);
+        }
         zaehle_urteil(NIMM_AN);
         return NIMM_AN;
     }
-    -- 5. Rules. State 0 means the bucket was full and the flow was
-    --    refused (the table's `voll` counter already ran): surface the
-    --    event on the counters lane too, then fall through to the rules
-    --    -- fail closed, the default policy DROP decides.
-    if zustand == FREI {
-        zaehle_voll();
-    }
+    -- 5. Rules. State 0 here means "no entry", not "bucket full": the
+    --    bucket fills only at create time, which runs after the verdict
+    --    below. Fail closed via the default policy DROP (STANDARD, owned
+    --    by regeln.gab, not repeated here).
     let urteil : u32 in 0 .. 2 = entscheide_regeln(proto, quelle, ziel, qport, zport, flaggen);
     -- 6. Count. The verdict always; the rule hit only when a rule
     --    matched (256 = default policy, no slot to count). The second
@@ -340,6 +362,23 @@ pub impl fn entscheide(laenge : u32 in 0 .. 1600, faden : u32 in 0 .. 15) -> u32
     let treffer : u32 in 0 .. 256 = treffer_index(proto, quelle, ziel, qport, zport, flaggen);
     if treffer <= 255 {
         zaehle_regel(treffer);
+    }
+    -- 7. Verdict gating (E2c): ONLY NIMM_AN touches the table. DROP and
+    --    ABGEWIESEN return without one write to Verbindung or Stand --
+    --    the spoofed reply of the E2 recipe (BEFUNDE-bm9.md) is DROPped
+    --    and promotes nothing, so the E2c follow-up frame finds no entry
+    --    and walks the rules again. A refused confirm (bucket full at
+    --    create time, answer 0) surfaces through `zaehle_voll`; the
+    --    verdict stands -- that flow's every packet walks the rules
+    --    (stateless fallback, still fail-closed).
+    if urteil == NIMM_AN {
+        let mut neu : u32 in 0 .. 3 = FREI;
+        locks VSPERRE {
+            neu = suche_oder_lege_an(quelle, ziel, qport, zport, proto, flaggen, jetzt);
+        }
+        if neu == FREI {
+            zaehle_voll();
+        }
     }
     return zaehle_weiter(urteil);
 }

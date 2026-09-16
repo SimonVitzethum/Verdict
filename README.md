@@ -1,4 +1,4 @@
-# Brandmauer — a Linux firewall written in Gabbro
+# Verdict — a Linux firewall written in Gabbro
 
 **A working, multithreaded packet filter whose decisions are written in Gabbro, not in shell.**
 Started 2026-09-16 as a real test of the language: not a demo, not a fragment — a firewall you
@@ -83,3 +83,7 @@ make lauf       # a loopback test against a network namespace
 
 Started 2026-09-16. Nothing is finished. What holds and what does not is measured in
 [`messung/`](messung/), and every refusal of the compiler is recorded there with its code.
+
+## Lizenz
+
+Apache License 2.0 — siehe [`LICENSE`](LICENSE).
