@@ -1,0 +1,273 @@
+-- gab/lauf.gab -- lane bm7: the program. `main`, the startup path, the worker loop.
+--
+-- What this file IS: a runnable single-worker firewall driver. `main` opens one
+-- netlink socket through the border (`netz_socket`), maps one receive buffer
+-- (`speicher_karte`), loads a compiled-in default policy (`raeume_alle` plus one
+-- `setze_regel`), and then works queue 0 in `arbeite`: `netz_empfangen` into the
+-- mapped buffer, sentinel discipline (NOCHMAL is retried, PAKETE_VERLOREN is
+-- counted, KEIN_WERT ends the loop), threshold shutdown through `anhalten`.
+--
+-- What this file IS NOT, and why (each wall is filed in messung/BEFUNDE-bm7.md):
+-- * no `clone` worker threads: the child handoff has no checked shape
+--   (BEFUNDE-bm5.md, Befund K-1). One worker, queue 0.
+-- * no rule file: the border declares no `open`/`read` (Befund L-2). The default
+--   policy below is compiled in: ACCEPT TCP destination port 80, everything else
+--   falls through to STANDARD (DROP). Fail closed.
+-- * no signal shutdown: the border declares no `sigaction` (Befund L-5). Shutdown
+--   happens on a packet counter threshold (GRENZE), which the operator tunes by
+--   rebuilding.
+-- * no netlink parse and no verdict bytes: that is lane bm6's module
+--   (`netzverbindung.gab`), which is not in this clone. The loop counts what the
+--   kernel hands over and leaves the verdict path open; the exact insertion point
+--   stands in a comment inside `arbeite`.
+-- * no `entscheide` call: lane bm8's module (`entscheidung.gab`) is not in this
+--   clone either. Calling it here would mean calling a symbol nothing defines.
+-- * no statistics through `write`: a table's address cannot be named in this
+--   language (Befund L-1, M127), so no buffer address ever reaches `sendto`,
+--   `recvfrom`, `bind` or `write`. The only addresses this file holds are the ones
+--   the kernel hands back (`speicher_karte` return). Counters live in `LaufStand`;
+--   the shutdown reason travels in the exit status because that is a value, not
+--   an address.
+--
+-- Wiring: this file checks ALONE (`gabbro pruefe gab/lauf.gab`). Cross-module
+-- calls enter as `extern fn` mirrors whose C prototypes are identical to the
+-- defining unit's (measured: the prototype lines are diffed in BERICHT-bm7.md).
+-- The unit link is `cc` over the emitted C files; no C is written by hand.
+module brandmauer::lauf {
+
+-- The worker loop below is deliberately non-terminating: it ends by `leave` on
+-- the counter threshold or on a dead socket, or by the environment (more packets
+-- arriving). That environment end is named here, with a falsifier of the same
+-- shape as the ten in systemrufe.gab.
+assume paketstrom_fliesst
+    "Der Netlink-Strom liefert weiter Nachrichten, solange die Warteschlange besteht; bleibt er aus, endet die Runde durch die Umgebung."
+    falsifier sonde_strom;
+
+impl fn sonde_strom() -> bool
+    effects { pure }
+    costs <= 4 ops
+{
+    return true;
+}
+
+-- Progress for the startup loop: the kernel hands out the socket after finitely
+-- many attempts. Same shape as above, own name so each loop names its end.
+assume steckdose_kommt
+    "Der Kern teilt die Netlink-Steckdose nach endlich vielen Versuchen zu; danach endet die Startrunde durch `leave`."
+    falsifier sonde_dose;
+
+impl fn sonde_dose() -> bool
+    effects { pure }
+    costs <= 4 ops
+{
+    return true;
+}
+
+-- Watchdog for the bounded loops. Diverging, as the bound demands: when the
+-- bound is exhausted the process does not carry on with a number that meant
+-- nothing. (Only `forever` lowers to C in this binary -- both `retry` shapes
+-- are refused at emission, C001; the startup retry therefore runs as a counted
+-- `forever` loop too. Filed as Befund L-3.)
+extern fn lauf_aufgegeben() -> never effects { diverges };
+
+-- Border mirrors. Each line mirrors one `pub` wrapper of gab/systemrufe.gab
+-- (same name, same parameters, same answer): the emitted C prototype is
+-- identical, so this file links against the emitted systemrufe unit. Only the
+-- calls a checked program can feed are mirrored: every wrapper taking a memory
+-- address (`netz_binden`, `netz_senden`, `netz_empfangen` except through a
+-- kernel-returned address, `sperre_warten`, `sperre_wecken`, `zeit_lesen`,
+-- `bericht_schreiben`) is unusable without an address-of, which the language
+-- refuses (M127, Befund L-1). `faden_start` is unusable on top of that (K-1).
+-- `effects { pure }` follows the house convention: no wrapper touches a Gabbro
+-- carrier of this unit; what the kernel does behind the call is the named
+-- `assume` in systemrufe.gab, not an effect here.
+extern fn netz_socket() -> u64 effects { pure };
+extern fn netz_empfangen(fd : u64, puffer : u64, laenge : u64, zeichen : u64, quelle : u64, quell_laenge : u64) -> u64 effects { pure };
+extern fn speicher_karte(laenge : u64) -> u64 effects { pure };
+extern fn anhalten(status : u64) -> u64 effects { pure };
+
+-- Loader mirrors. Each line mirrors one `pub` function of gab/regeln.gab with
+-- the C-identical parameter list: `index into Regel` lowers to `uint32_t`, so
+-- the slot travels as a plain `u32` here (the prototype diff stands in
+-- BERICHT-bm7.md). The ranges mirror the originals field by field.
+extern fn raeume_alle() effects { pure };
+extern fn setze_regel(i : u32, aktiv : u32 in 0 .. 1, proto_any : u32 in 0 .. 1, proto : u32 in 0 .. 255, quell_any : u32 in 0 .. 1, quelle : u32, qmask : u32, ziel_any : u32 in 0 .. 1, ziel : u32, zmask : u32, qport_any : u32 in 0 .. 1, qport_lo : u32 in 0 .. 65535, qport_hi : u32 in 0 .. 65535, zport_any : u32 in 0 .. 1, zport_lo : u32 in 0 .. 65535, zport_hi : u32 in 0 .. 65535, flaggen_any : u32 in 0 .. 1, flaggen_maske : u32 in 0 .. 255, flaggen_wert : u32 in 0 .. 255, urteil : u32 in 0 .. 2, nummer : u32 in 0 .. 255) effects { pure };
+
+-- The three sentinels of the border contract (values copied from
+-- gab/systemrufe.gab): NOCHMAL means EINTR/EAGAIN, call again; PAKETE_VERLOREN
+-- means ENOBUFS, the kernel dropped packets; KEIN_WERT is terminal.
+pub const KEIN_WERT : u64 = u64::max;
+pub const NOCHMAL : u64 = u64::max - 1;
+pub const PAKETE_VERLOREN : u64 = u64::max - 2;
+
+-- The queue this worker serves. Single worker, queue 0; scale-out is a root
+-- procedure (BERICHT-bm7.md), not a second thread (K-1).
+pub const WARTESCHLANGE : u32 = 0;
+
+-- Receive buffer size in bytes. 65536 covers the largest netlink datagram the
+-- queue hands over; the driver truncates nothing, the buffer is mapped once.
+pub const PUFFER_GROESSE : u64 = 65536;
+
+-- Shutdown threshold: packets received before the worker leaves its loop and
+-- the process ends through `anhalten`. Signal handling would need `sigaction`,
+-- which the border does not declare (Befund L-5); until then the operator tunes
+-- this number and rebuilds.
+pub const GRENZE : u32 = 1000000;
+
+-- The worker's own statistics. One in flight, one thread, no lock: the loader
+-- runs before the loop, the loop owns the row. A lock here would be a contract
+-- nobody takes (same reading as BEFUNDE-bm2.md for the rule table), so the
+-- E247 footprint hints stand, documented there and in BEFUNDE-bm7.md.
+-- Fields: received datagrams, ENOBUFS events, EINTR/EAGAIN retries, and the
+-- shutdown reason (0 clean, 120 receive path dead).
+pub table LaufStand count 1 {
+    slot {
+        pakete : u32,
+        verlust : u32,
+        nochmal : u32,
+        fehler : u32,
+    }
+}
+
+-- Compiled-in default policy (Befund L-2: no rule file without `open`/`read`).
+-- Clears the table, then installs exactly one rule: ACCEPT TCP to destination
+-- port 80. Everything else falls through to STANDARD, which is DROP. Fail
+-- closed; a firewall nobody configured drops.
+impl fn lade_grundregeln()
+    effects { pure }
+{
+    raeume_alle();
+    setze_regel(0, 1, 0, 6, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 80, 80, 1, 0, 0, 1, 0);
+    return;
+}
+
+-- The worker. One pass is one `netz_empfangen` into the mapped buffer:
+-- NOCHMAL is not a failure (counted, next pass), PAKETE_VERLOREN is not a
+-- failure either (counted in `verlust`, next pass -- the operator learns it
+-- from the row and from the exit status), KEIN_WERT ends the loop with the
+-- reason in `fehler`. Any other answer is a byte count: counted in `pakete`,
+-- and at GRENZE the loop leaves for shutdown.
+--
+-- INSERTION POINT for lanes bm6/bm8: where the `else` arm counts the packet,
+-- the netlink parse (`nfgenmsg`/Attribute in bm6's module), the copy into the
+-- `Paket` table, the `entscheide(laenge, faden)` call (bm8) and the verdict
+-- `sendto` belong. They are not here because neither defining module is in
+-- this clone and because the byte copy needs an address-of the language
+-- refuses (Befund L-1). Nothing in this loop changes shape when they land:
+-- parse, decide and answer happen inside that arm, per datagram.
+impl fn arbeite(steckdose : u64, puffer : u64)
+    effects { reads LaufStand, writes LaufStand.slots }
+{
+    forever runde
+        per_pass bounded 128 ops
+        on_exceeded lauf_aufgegeben
+        effects { reads LaufStand, writes LaufStand.slots }
+        progress paketstrom_fliesst
+    {
+        let v : u64 = netz_empfangen(steckdose, puffer, PUFFER_GROESSE, 0, 0, 0);
+        if v == NOCHMAL {
+            if LaufStand.slots[0].nochmal < u32::max {
+                LaufStand.slots[0].nochmal += 1;
+            }
+        } else {
+            if v == PAKETE_VERLOREN {
+                if LaufStand.slots[0].verlust < u32::max {
+                    LaufStand.slots[0].verlust += 1;
+                }
+            } else {
+                if v == KEIN_WERT {
+                    LaufStand.slots[0].fehler = 120;
+                    leave runde;
+                } else {
+                    if LaufStand.slots[0].pakete < u32::max {
+                        LaufStand.slots[0].pakete += 1;
+                    }
+                    if LaufStand.slots[0].pakete >= GRENZE {
+                        leave runde;
+                    }
+                }
+            }
+        }
+    }
+    return;
+}
+
+-- Exit statuses. Small literals at both the `anhalten` call and the `return`
+-- (a `u64` status cannot narrow to the `i32` answer without a range the
+-- checker would hold us to, so the number stands twice, once per type):
+--   0   threshold reached, no kernel drops seen;
+--   1   threshold reached, drops were counted (see `verlust`);
+--   110 the socket never came up (KEIN_WERT or PAKETE_VERLOREN at startup, or
+--       64 NOCHMAL answers in a row);
+--   111 the receive buffer never mapped;
+--   120 the receive path died (KEIN_WERT from `netz_empfangen`).
+pub impl fn main() -> i32
+    effects { reads LaufStand, writes LaufStand.slots }
+{
+    -- Startup: one netlink socket. NOCHMAL is retried up to 64 times in a
+    -- counted `forever` loop (the retry policy lives with the caller -- that
+    -- is the sentinel contract); anything else is taken once and classified
+    -- below. A plain `retry` would read better and checks, but neither `retry`
+    -- shape lowers to C in this binary (C001, Befund L-3), so the counter and
+    -- the `leave` stand here instead of in the loop form.
+    let mut steckdose : u64 = KEIN_WERT;
+    let mut versuche : u32 in 0 .. 64 = 0;
+    forever start
+        per_pass bounded 64 ops
+        on_exceeded lauf_aufgegeben
+        effects { pure }
+        progress steckdose_kommt
+    {
+        let s : u64 = netz_socket();
+        if s == NOCHMAL {
+            if versuche < 64 {
+                versuche += 1;
+            } else {
+                leave start;
+            }
+        } else {
+            steckdose = s;
+            leave start;
+        }
+    }
+    if steckdose == KEIN_WERT {
+        anhalten(110);
+        return 110;
+    }
+    if steckdose == PAKETE_VERLOREN {
+        anhalten(110);
+        return 110;
+    }
+    -- Startup: one receive buffer. Anonymous memory, read/write, private; the
+    -- answer is the base address the kernel chose, handed to `netz_empfangen`
+    -- as a `u64` -- the one address shape this language can carry.
+    let puffer : u64 = speicher_karte(PUFFER_GROESSE);
+    if puffer == KEIN_WERT {
+        anhalten(111);
+        return 111;
+    }
+    if puffer == NOCHMAL {
+        anhalten(111);
+        return 111;
+    }
+    if puffer == PAKETE_VERLOREN {
+        anhalten(111);
+        return 111;
+    }
+    -- Startup: the compiled-in default policy, before the first datagram.
+    lade_grundregeln();
+    -- Work. Returns only through `leave`: threshold or dead socket.
+    arbeite(steckdose, puffer);
+    if LaufStand.slots[0].fehler == 120 {
+        anhalten(120);
+        return 120;
+    }
+    if LaufStand.slots[0].verlust > 0 {
+        anhalten(1);
+        return 1;
+    }
+    anhalten(0);
+    return 0;
+}
+
+}
