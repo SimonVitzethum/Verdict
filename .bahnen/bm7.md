@@ -1,0 +1,9 @@
+YOUR MODULE: `gab/lauf.gab` — the program: `main`, the buffers, the worker threads, the loop. This is the lane that turns five modules into something that runs.
+
+1. **`pub impl fn main() -> i32`** — in this language a function called `main` emits `int32_t main(void)`, which is how this becomes a runnable Linux program (measured in the Gabbro tree, 2026-09-15).
+2. **Start-up**: open one netlink socket per worker through the syscall wrappers, bind it, send the queue configuration, `mmap` a receive buffer per worker and a stack per worker.
+3. **The workers**: `clone` one thread per queue (the syscall lane reports whether and how that can be written — read its finding file first). Each worker loops: `recvfrom` into its buffer → parse the netlink message → fill the `Paket` table → call `entscheide(laenge, faden)` → build and `sendto` the verdict. **`EINTR` and `EAGAIN` are not failures**; `ENOBUFS` means the kernel dropped packets and must be counted and reported, not ignored.
+4. **The rule file**: read a simple text rule file at start-up (one rule per line) through `read`, parse it in Gabbro, and load it with `setze_regel`. A firewall nobody can configure is not usable. If reading a file turns out to be a wall, say so precisely and fall back to a compiled-in default policy — with the finding written down.
+5. **Shutdown and statistics**: on a signal (or, if signal handling is a wall, on a counter threshold — say which), print the counters through `write` and `exit_group`.
+
+**This lane is where "it runs" is decided, so measure it that way**: report the exact command line that builds it, the exact `nft` rule that attaches it, and what actually happened when you ran it. If you cannot run it in this clone (no root, no network namespace), say so and write down the procedure someone with root would follow — step by step, no hand-waving.

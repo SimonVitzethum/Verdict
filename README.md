@@ -56,8 +56,8 @@ impossibility is the finding, and it gets written down with the compiler's own w
   connection table, the packet buffer. A firewall under load must behave when a table is full,
   and that behaviour is a decision written into the rules, not an allocation failure.
 - **No standard library.** No `memcpy`, no queues, no strings. What is needed gets written.
-- **Threads come from the driver**, and the shared state is protected by locks and atomics the
-  Gabbro side declares.
+- **Threads come from `clone`**, called as a system call from Gabbro, and the shared state is
+  protected by locks and atomics the Gabbro side declares.
 - **Costs and effects are declared.** Every function says what it writes and what it costs; the
   checker holds it to that. A packet path with an undeclared write does not compile.
 
@@ -74,7 +74,7 @@ messung/      what was measured, and every refusal met on the way
 ## Building
 
 ```
-make            # checks every .gab, emits C, compiles the driver, links
+make            # checks every .gab, emits C, compiles and links the program
 make pruefen    # the checker alone, over every module
 make lauf       # a loopback test against a network namespace
 ```
