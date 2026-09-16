@@ -1,0 +1,646 @@
+-- gab/netzverbindung.gab -- lane bm6: the NFQUEUE protocol over raw netlink.
+--
+-- The kernel hands every queued packet to the firewall as a netlink message,
+-- and the verdict travels back the same way. No library does this here: every
+-- byte below is written by hand. Three jobs:
+--   1. configuration, once per worker queue (baue_binden, baue_werte,
+--      baue_wartelang, baue_merkmale): NFQNL_MSG_CONFIG with NFQA_CFG_CMD =
+--      NFQNL_CFG_CMD_BIND, then NFQA_CFG_PARAMS with copy mode
+--      NFQNL_COPY_PACKET and a copy range, a queue maxlen, and the flags that
+--      keep the queue working under load (FAIL_OPEN);
+--   2. receiving (suche_paket): parse nlmsghdr/nfgenmsg, walk the attributes,
+--      find NFQA_PACKET_HDR (packet id, big-endian) and NFQA_PAYLOAD, and
+--      record offset and length so each payload byte is handed out with a
+--      bound check (hole_nutzlast);
+--   3. the verdict (baue_urteil): NFQNL_MSG_VERDICT with NFQA_VERDICT_HDR
+--      carrying packet id and verdict word.
+--
+-- Byte order is the trap and the point. Netlink headers (nlmsghdr length,
+-- type, flags; nlattr length, type) are host order; nfnetlink attribute
+-- payloads (packet id, verdict, res_id, copy range, maxlen, mask, flags) are
+-- big-endian. The conversion is drehe32/drehe16, written by hand (Gabbro has
+-- no htonl) and tested (messung/BERICHT-bm6.md). The rule at every site:
+-- multi-byte header fields assemble low-byte-first (host order); attribute
+-- payloads assemble low-byte-first and then run through drehe32/drehe16 --
+-- the swap IS the big-endian interpretation. Serializing is the mirror:
+-- drehe32/drehe16 first, then low-byte-first. Host order is written
+-- low-byte-first, which assumes a little-endian host: see
+-- rechner_klein_endian below (x86_64; shape-only falsifier, same standing as
+-- the sonde_* in gab/systemrufe.gab).
+--
+-- Boundaries, stated so misuse is visible:
+-- * The tables below (Empfang, Senden, Ergebnis) are this module's working
+--   buffers, one set per worker queue. The packet buffer Paket and the
+--   decoded header Kopf belong to gab/pakete.gab (ARCHITEKTUR.md); this file
+--   never names them. The byte-by-byte copy of the payload into Paket is the
+--   driver lane's (lauf.gab) job through hole_nutzlast/gib_laenge: each call
+--   moves exactly one byte, checked against the recorded payload length and
+--   the buffer count.
+-- * The system calls themselves (socket, bind, sendto, recvfrom) belong to
+--   gab/systemrufe.gab: netz_socket, netz_binden, netz_senden, netz_empfangen.
+--   This file calls none of them. A table has no address in Gabbro (M127, see
+--   messung/BEFUNDE-bm6.md, Befund A-1), so handing a buffer to sendto as a
+--   u64 address is not expressible here either: the driver drains Senden
+--   through hole_senden and fills Empfang through lege_empfang, and the
+--   sendto/recvfrom calls with the resulting addresses are lauf.gab's.
+-- * No lock in this file: each worker owns its queue and its buffers, and
+--   ARCHITEKTUR.md names no lock for this module. The checker's footprint
+--   hints (E247) that follow are recorded in messung/BEFUNDE-bm6.md.
+--
+-- Strictness (refuse, never interpret): a short message, a foreign message
+-- type, a nonzero family or version, an overrunning or short attribute, a
+-- short or missing packet header or a missing/empty payload all yield a named
+-- Zustand, never a guess. A payload longer than 1600 bytes is capped at 1600
+-- (ARCHITEKTUR.md: a longer packet is truncated by the driver), with the
+-- capped length recorded. Unknown attributes (MARK, TIMESTAMP, ...) are skipped.
+module brandmauer::netzverbindung {
+
+-- Message sizes the kernel ABI fixes (linux/netlink.h, nfnetlink.h,
+-- nfnetlink_queue.h -- read off the local headers, see BERICHT-bm6.md).
+pub const EMPFANG_GROESSE : u32 = 8192;
+pub const SENDEN_GROESSE : u32 = 64;
+
+-- nlmsghdr is 16 bytes, nfgenmsg 4, an nlattr header 4; attributes pad to 4.
+pub const KOPF_NETZ : u32 = 16;
+pub const KOPF_FAMILIE : u32 = 4;
+pub const KOPF_ATTR : u32 = 4;
+
+-- Netlink message types: NFNL_SUBSYS_QUEUE (3) << 8 | operation.
+pub const TYP_PAKET : u32 = 768;
+pub const TYP_URTEIL : u32 = 769;
+pub const TYP_EINSTELL : u32 = 770;
+
+-- Attribute types (nfqnl_attr_type / nfqnl_attr_config).
+pub const ATTR_PAKET_KOPF : u32 = 1;
+pub const ATTR_URTEIL_KOPF : u32 = 2;
+pub const ATTR_NUTZLAST : u32 = 10;
+pub const ATTR_EINSTELL_BEFEHL : u32 = 1;
+pub const ATTR_EINSTELL_WERTE : u32 = 2;
+pub const ATTR_WARTELANG : u32 = 3;
+pub const ATTR_MASKE : u32 = 4;
+pub const ATTR_MERKMALE : u32 = 5;
+
+-- Config commands and copy modes.
+pub const BEFEHL_BINDEN : u32 = 1;
+pub const KOPIE_PAKET : u32 = 2;
+
+-- Flags for NFQA_CFG_FLAGS (keep the queue working under load).
+pub const MERKMAL_OFFEN : u32 = 1;
+
+-- What we ask the kernel for: whole packets up to the driver MTU, a deep
+-- queue, fail-open so a dead firewall does not wedge the machine. These are
+-- the values the driver (lauf.gab) passes to baue_werte / baue_wartelang /
+-- baue_merkmale; the builders themselves take plain parameters and promise
+-- nothing about policy.
+pub const KOPIE_BREITE : u32 = 1600;
+pub const WARTESCHLANGE : u32 = 1024;
+
+-- Request flag and protocol version on the wire.
+pub const KENNUNG_ANFRAGE : u32 = 1;
+pub const NETZ_AUSGABE : u32 = 0;
+
+-- Parse outcomes. One u32, named so the driver can match without magic.
+pub const BEREIT : u32 in 0 .. 7 = 0;
+pub const KURZ : u32 in 0 .. 7 = 1;
+pub const TYP_FEHLER : u32 in 0 .. 7 = 2;
+pub const ATTR_FEHLER : u32 in 0 .. 7 = 3;
+pub const IDS_FEHLER : u32 in 0 .. 7 = 4;
+pub const LEER : u32 in 0 .. 7 = 5;
+
+pub type Zustand = u32 in 0 .. 7;
+pub type Einzelbyte = u32 in 0 .. 255;
+
+-- The receive buffer: one netlink datagram, filled by the driver through
+-- lege_empfang (recvfrom itself is lauf.gab's, see the file head).
+pub table Empfang count EMPFANG_GROESSE {
+    slot {
+        byte : Einzelbyte,
+    }
+}
+
+-- The send buffer: config and verdict messages, drained by the driver
+-- through hole_senden (sendto itself is lauf.gab's, see the file head).
+pub table Senden count SENDEN_GROESSE {
+    slot {
+        byte : Einzelbyte,
+    }
+}
+
+-- What suche_paket found: status, packet id (host order), payload offset
+-- and length inside Empfang, queue number, hook, message type.
+pub table Ergebnis count 1 {
+    slot {
+        zustand : Zustand,
+        kennung : u32,
+        versatz : u32 in 0 .. 8191,
+        laenge : u32 in 0 .. 1600,
+        reihung : u32 in 0 .. 65535,
+        haken : Einzelbyte,
+        typ : u32 in 0 .. 65535,
+    }
+}
+
+-- Little-endian host: the ..._he writes below store low-byte-first, which is
+-- host order only where the host is little-endian (x86_64). The falsifier is
+-- shape-only -- a real probe would have to reinterpret a word as bytes,
+-- which the language has no form for -- same standing as the sonde_* in
+-- gab/systemrufe.gab (BEFUNDE-bm5.md).
+assume rechner_klein_endian
+    "x86_64 legt Mehrbyte-Zahlen klein-endian ab; die He-Schreibungen dieses Moduls schreiben niederwertiges Byte zuerst und sind dort Gastgeberreihenfolge."
+    falsifier sonde_klein_endian;
+
+impl fn sonde_klein_endian() -> bool
+    effects { pure }
+    costs   <= 4 ops
+{
+    return true;
+}
+
+-- Contention/bound exit for the attribute walk: diverging, as bounded
+-- retry demands (same shape as zaehler_streit in gab/zaehler.gab).
+extern fn netz_streit() -> never effects { diverges };
+
+-- Byte swap: the htonl Gabbro does not have. b0..b3 are single bytes, so
+-- each product and the sum stay inside u32 (max 4294967295 = u32::max).
+pub impl fn drehe32(x : u32) -> u32
+    effects { pure }
+    costs   <= 32 ops
+{
+    let b0 : Einzelbyte = x & 255;
+    let b1 : Einzelbyte = (x >> 8) & 255;
+    let b2 : Einzelbyte = (x >> 16) & 255;
+    let b3 : Einzelbyte = (x >> 24) & 255;
+    let t0 : u32 = b0 * 16777216;
+    let t1 : u32 = b1 * 65536;
+    let t2 : u32 = b2 * 256;
+    return t0 + t1 + t2 + b3;
+}
+
+-- Half-word swap for res_id and the u16 header fields.
+pub impl fn drehe16(x : u32 in 0 .. 65535) -> u32 in 0 .. 65535
+    effects { pure }
+    costs   <= 16 ops
+{
+    let lo : Einzelbyte = x & 255;
+    let hi : Einzelbyte = (x >> 8) & 255;
+    return lo * 256 + hi;
+}
+
+-- Fill one receive byte (the driver's recvfrom lands here).
+pub impl fn lege_empfang(i : index into Empfang, w : Einzelbyte)
+    effects { reads Empfang, writes Empfang.slots }
+    costs <= 4 ops
+{
+    Empfang.slots[i].byte = w;
+    return;
+}
+
+-- Drain one send byte (the driver's sendto starts here).
+pub impl fn hole_senden(i : index into Senden) -> Einzelbyte
+    effects { reads Senden, reads Senden.slots }
+    costs <= 4 ops
+{
+    return Senden.slots[i].byte;
+}
+
+-- One payload byte with both bound checks: against the recorded payload
+-- length and against the buffer count. Out of payload yields 0; the driver
+-- only calls i below gib_laenge, so 0 is never a payload byte misread.
+pub impl fn hole_nutzlast(i : u32 in 0 .. 1599) -> Einzelbyte
+    effects { reads Empfang, reads Empfang.slots, reads Ergebnis, reads Ergebnis.slots }
+    costs <= 16 ops
+{
+    let grenze : u32 in 0 .. 1600 = Ergebnis.slots[0].laenge;
+    if i >= grenze {
+        return 0;
+    }
+    let anfang : u32 in 0 .. 8191 = Ergebnis.slots[0].versatz;
+    let s : u32 = anfang + i;
+    narrow s to 0 .. 8191 else { return 0; }
+    return Empfang.slots[s].byte;
+}
+
+pub impl fn gib_zustand() -> Zustand
+    effects { reads Ergebnis, reads Ergebnis.slots }
+    costs <= 4 ops
+{
+    return Ergebnis.slots[0].zustand;
+}
+
+pub impl fn gib_kennung() -> u32
+    effects { reads Ergebnis, reads Ergebnis.slots }
+    costs <= 4 ops
+{
+    return Ergebnis.slots[0].kennung;
+}
+
+pub impl fn gib_laenge() -> u32 in 0 .. 1600
+    effects { reads Ergebnis, reads Ergebnis.slots }
+    costs <= 4 ops
+{
+    return Ergebnis.slots[0].laenge;
+}
+
+pub impl fn gib_versatz() -> u32 in 0 .. 8191
+    effects { reads Ergebnis, reads Ergebnis.slots }
+    costs <= 4 ops
+{
+    return Ergebnis.slots[0].versatz;
+}
+
+pub impl fn gib_reihung() -> u32 in 0 .. 65535
+    effects { reads Ergebnis, reads Ergebnis.slots }
+    costs <= 4 ops
+{
+    return Ergebnis.slots[0].reihung;
+}
+
+pub impl fn gib_haken() -> Einzelbyte
+    effects { reads Ergebnis, reads Ergebnis.slots }
+    costs <= 4 ops
+{
+    return Ergebnis.slots[0].haken;
+}
+
+pub impl fn gib_typ() -> u32 in 0 .. 65535
+    effects { reads Ergebnis, reads Ergebnis.slots }
+    costs <= 4 ops
+{
+    return Ergebnis.slots[0].typ;
+}
+
+-- Bind this worker's queue: nlmsghdr (16) + nfgenmsg (4) + one attribute
+-- (4 header + 4 command payload) = 28 bytes. The queue number travels as
+-- res_id (big-endian: swapped, then low-byte-first); the command payload is
+-- command 1, pad, pf 0.
+pub impl fn baue_binden(reihung : u32 in 0 .. 65535) -> u32 in 0 .. 64
+    effects { reads Senden, writes Senden.slots }
+    costs <= 56 ops
+{
+    let qid : u32 in 0 .. 65535 = drehe16(reihung);
+    Senden.slots[0].byte = 28;
+    Senden.slots[1].byte = 0;
+    Senden.slots[2].byte = 0;
+    Senden.slots[3].byte = 0;
+    Senden.slots[4].byte = 2;
+    Senden.slots[5].byte = 3;
+    Senden.slots[6].byte = 1;
+    Senden.slots[7].byte = 0;
+    Senden.slots[8].byte = 0;
+    Senden.slots[9].byte = 0;
+    Senden.slots[10].byte = 0;
+    Senden.slots[11].byte = 0;
+    Senden.slots[12].byte = 0;
+    Senden.slots[13].byte = 0;
+    Senden.slots[14].byte = 0;
+    Senden.slots[15].byte = 0;
+    Senden.slots[16].byte = 0;
+    Senden.slots[17].byte = 0;
+    Senden.slots[18].byte = qid & 255;
+    Senden.slots[19].byte = (qid >> 8) & 255;
+    Senden.slots[20].byte = 8;
+    Senden.slots[21].byte = 0;
+    Senden.slots[22].byte = 1;
+    Senden.slots[23].byte = 0;
+    Senden.slots[24].byte = 1;
+    Senden.slots[25].byte = 0;
+    Senden.slots[26].byte = 0;
+    Senden.slots[27].byte = 0;
+    return 28;
+}
+
+-- Copy mode and range: attribute payload is copy_range (big-endian u32) and
+-- copy_mode (one byte); the struct is packed (5 bytes), so the attribute
+-- length is 9, padded to 12 on the wire. Total 16 + 4 + 12 = 32 bytes.
+pub impl fn baue_werte(reihung : u32 in 0 .. 65535, bereich : u32, modus : Einzelbyte) -> u32 in 0 .. 64
+    effects { reads Senden, writes Senden.slots }
+    costs <= 112 ops
+{
+    let qid : u32 in 0 .. 65535 = drehe16(reihung);
+    let weit : u32 = drehe32(bereich);
+    Senden.slots[0].byte = 32;
+    Senden.slots[1].byte = 0;
+    Senden.slots[2].byte = 0;
+    Senden.slots[3].byte = 0;
+    Senden.slots[4].byte = 2;
+    Senden.slots[5].byte = 3;
+    Senden.slots[6].byte = 1;
+    Senden.slots[7].byte = 0;
+    Senden.slots[8].byte = 0;
+    Senden.slots[9].byte = 0;
+    Senden.slots[10].byte = 0;
+    Senden.slots[11].byte = 0;
+    Senden.slots[12].byte = 0;
+    Senden.slots[13].byte = 0;
+    Senden.slots[14].byte = 0;
+    Senden.slots[15].byte = 0;
+    Senden.slots[16].byte = 0;
+    Senden.slots[17].byte = 0;
+    Senden.slots[18].byte = qid & 255;
+    Senden.slots[19].byte = (qid >> 8) & 255;
+    Senden.slots[20].byte = 9;
+    Senden.slots[21].byte = 0;
+    Senden.slots[22].byte = 2;
+    Senden.slots[23].byte = 0;
+    Senden.slots[24].byte = weit & 255;
+    Senden.slots[25].byte = (weit >> 8) & 255;
+    Senden.slots[26].byte = (weit >> 16) & 255;
+    Senden.slots[27].byte = (weit >> 24) & 255;
+    Senden.slots[28].byte = modus;
+    Senden.slots[29].byte = 0;
+    Senden.slots[30].byte = 0;
+    Senden.slots[31].byte = 0;
+    return 32;
+}
+
+-- Queue depth: one u32 attribute (big-endian). Total 16 + 4 + 8 = 28 bytes.
+pub impl fn baue_wartelang(reihung : u32 in 0 .. 65535, maximum : u32) -> u32 in 0 .. 64
+    effects { reads Senden, writes Senden.slots }
+    costs <= 104 ops
+{
+    let qid : u32 in 0 .. 65535 = drehe16(reihung);
+    let tief : u32 = drehe32(maximum);
+    Senden.slots[0].byte = 28;
+    Senden.slots[1].byte = 0;
+    Senden.slots[2].byte = 0;
+    Senden.slots[3].byte = 0;
+    Senden.slots[4].byte = 2;
+    Senden.slots[5].byte = 3;
+    Senden.slots[6].byte = 1;
+    Senden.slots[7].byte = 0;
+    Senden.slots[8].byte = 0;
+    Senden.slots[9].byte = 0;
+    Senden.slots[10].byte = 0;
+    Senden.slots[11].byte = 0;
+    Senden.slots[12].byte = 0;
+    Senden.slots[13].byte = 0;
+    Senden.slots[14].byte = 0;
+    Senden.slots[15].byte = 0;
+    Senden.slots[16].byte = 0;
+    Senden.slots[17].byte = 0;
+    Senden.slots[18].byte = qid & 255;
+    Senden.slots[19].byte = (qid >> 8) & 255;
+    Senden.slots[20].byte = 8;
+    Senden.slots[21].byte = 0;
+    Senden.slots[22].byte = 3;
+    Senden.slots[23].byte = 0;
+    Senden.slots[24].byte = tief & 255;
+    Senden.slots[25].byte = (tief >> 8) & 255;
+    Senden.slots[26].byte = (tief >> 16) & 255;
+    Senden.slots[27].byte = (tief >> 24) & 255;
+    return 28;
+}
+
+-- Flags and mask: two u32 attributes (big-endian each).
+-- Total 16 + 4 + 8 + 8 = 36 bytes.
+pub impl fn baue_merkmale(reihung : u32 in 0 .. 65535, maske : u32, merkmale : u32) -> u32 in 0 .. 64
+    effects { reads Senden, writes Senden.slots }
+    costs <= 160 ops
+{
+    let qid : u32 in 0 .. 65535 = drehe16(reihung);
+    let decke : u32 = drehe32(maske);
+    let zeichen : u32 = drehe32(merkmale);
+    Senden.slots[0].byte = 36;
+    Senden.slots[1].byte = 0;
+    Senden.slots[2].byte = 0;
+    Senden.slots[3].byte = 0;
+    Senden.slots[4].byte = 2;
+    Senden.slots[5].byte = 3;
+    Senden.slots[6].byte = 1;
+    Senden.slots[7].byte = 0;
+    Senden.slots[8].byte = 0;
+    Senden.slots[9].byte = 0;
+    Senden.slots[10].byte = 0;
+    Senden.slots[11].byte = 0;
+    Senden.slots[12].byte = 0;
+    Senden.slots[13].byte = 0;
+    Senden.slots[14].byte = 0;
+    Senden.slots[15].byte = 0;
+    Senden.slots[16].byte = 0;
+    Senden.slots[17].byte = 0;
+    Senden.slots[18].byte = qid & 255;
+    Senden.slots[19].byte = (qid >> 8) & 255;
+    Senden.slots[20].byte = 8;
+    Senden.slots[21].byte = 0;
+    Senden.slots[22].byte = 4;
+    Senden.slots[23].byte = 0;
+    Senden.slots[24].byte = decke & 255;
+    Senden.slots[25].byte = (decke >> 8) & 255;
+    Senden.slots[26].byte = (decke >> 16) & 255;
+    Senden.slots[27].byte = (decke >> 24) & 255;
+    Senden.slots[28].byte = 8;
+    Senden.slots[29].byte = 0;
+    Senden.slots[30].byte = 5;
+    Senden.slots[31].byte = 0;
+    Senden.slots[32].byte = zeichen & 255;
+    Senden.slots[33].byte = (zeichen >> 8) & 255;
+    Senden.slots[34].byte = (zeichen >> 16) & 255;
+    Senden.slots[35].byte = (zeichen >> 24) & 255;
+    return 36;
+}
+
+-- The verdict: NFQNL_MSG_VERDICT with NFQA_VERDICT_HDR (verdict and packet
+-- id, both big-endian: swapped, then low-byte-first).
+-- Total 16 + 4 + 12 = 32 bytes.
+pub impl fn baue_urteil(kennung : u32, urteil : u32 in 0 .. 2, reihung : u32 in 0 .. 65535) -> u32 in 0 .. 64
+    effects { reads Senden, writes Senden.slots }
+    costs <= 152 ops
+{
+    let qid : u32 in 0 .. 65535 = drehe16(reihung);
+    let spruch : u32 = drehe32(urteil);
+    let paket : u32 = drehe32(kennung);
+    Senden.slots[0].byte = 32;
+    Senden.slots[1].byte = 0;
+    Senden.slots[2].byte = 0;
+    Senden.slots[3].byte = 0;
+    Senden.slots[4].byte = 1;
+    Senden.slots[5].byte = 3;
+    Senden.slots[6].byte = 1;
+    Senden.slots[7].byte = 0;
+    Senden.slots[8].byte = 0;
+    Senden.slots[9].byte = 0;
+    Senden.slots[10].byte = 0;
+    Senden.slots[11].byte = 0;
+    Senden.slots[12].byte = 0;
+    Senden.slots[13].byte = 0;
+    Senden.slots[14].byte = 0;
+    Senden.slots[15].byte = 0;
+    Senden.slots[16].byte = 0;
+    Senden.slots[17].byte = 0;
+    Senden.slots[18].byte = qid & 255;
+    Senden.slots[19].byte = (qid >> 8) & 255;
+    Senden.slots[20].byte = 12;
+    Senden.slots[21].byte = 0;
+    Senden.slots[22].byte = 2;
+    Senden.slots[23].byte = 0;
+    Senden.slots[24].byte = spruch & 255;
+    Senden.slots[25].byte = (spruch >> 8) & 255;
+    Senden.slots[26].byte = (spruch >> 16) & 255;
+    Senden.slots[27].byte = (spruch >> 24) & 255;
+    Senden.slots[28].byte = paket & 255;
+    Senden.slots[29].byte = (paket >> 8) & 255;
+    Senden.slots[30].byte = (paket >> 16) & 255;
+    Senden.slots[31].byte = (paket >> 24) & 255;
+    return 32;
+}
+
+-- Zero the result and answer the ground. Every refused path funnels here,
+-- so no consumer ever sees a stale packet id beside an error (same write
+-- discipline as ungueltig in gab/pakete.gab: one write per field per call).
+impl fn ergebnis_leer(grund : Zustand, typ : u32 in 0 .. 65535) -> Zustand
+    effects { reads Ergebnis, writes Ergebnis.slots }
+    costs <= 16 ops
+{
+    Ergebnis.slots[0].zustand = grund;
+    Ergebnis.slots[0].kennung = 0;
+    Ergebnis.slots[0].versatz = 0;
+    Ergebnis.slots[0].laenge = 0;
+    Ergebnis.slots[0].reihung = 0;
+    Ergebnis.slots[0].haken = 0;
+    Ergebnis.slots[0].typ = typ;
+    return grund;
+}
+
+-- Parse one incoming netlink message of meldung bytes in Empfang: check the
+-- nlmsghdr (length, type), the nfgenmsg (family, version, queue), then walk
+-- the attributes with 4-byte alignment (NLA_ALIGN), gathering the packet id
+-- out of NFQA_PACKET_HDR and offset/length out of NFQA_PAYLOAD. Fills
+-- Ergebnis exactly once per call and answers the Zustand.
+pub impl fn suche_paket(meldung : u32 in 0 .. 8192) -> Zustand
+    effects { reads Empfang, reads Empfang.slots, reads Ergebnis, writes Ergebnis.slots }
+    costs <= 301000 ops
+{
+    if meldung < 20 {
+        return ergebnis_leer(1, 0);
+    }
+    let l0 : Einzelbyte = Empfang.slots[0].byte;
+    let l1 : Einzelbyte = Empfang.slots[1].byte;
+    let l2 : Einzelbyte = Empfang.slots[2].byte;
+    let l3 : Einzelbyte = Empfang.slots[3].byte;
+    let mlen : u32 = l0 + l1 * 256 + l2 * 65536 + l3 * 16777216;
+    if mlen < 20 {
+        return ergebnis_leer(1, 0);
+    }
+    if mlen > meldung {
+        return ergebnis_leer(1, 0);
+    }
+    let y0 : Einzelbyte = Empfang.slots[4].byte;
+    let y1 : Einzelbyte = Empfang.slots[5].byte;
+    let typ : u32 in 0 .. 65535 = y0 + y1 * 256;
+    if typ != 768 {
+        return ergebnis_leer(2, typ);
+    }
+    let familie : Einzelbyte = Empfang.slots[16].byte;
+    if familie != 0 {
+        return ergebnis_leer(2, typ);
+    }
+    let ausgabe : Einzelbyte = Empfang.slots[17].byte;
+    if ausgabe != 0 {
+        return ergebnis_leer(2, typ);
+    }
+    let r0 : Einzelbyte = Empfang.slots[18].byte;
+    let r1 : Einzelbyte = Empfang.slots[19].byte;
+    -- res_id is big-endian: low-byte-first assembly, then the swap.
+    let reihung : u32 in 0 .. 65535 = drehe16(r0 + r1 * 256);
+    let mut versatz : u32 in 0 .. 8192 = 20;
+    let mut kennung : u32 = 0;
+    let mut haken : Einzelbyte = 0;
+    let mut nutzversatz : u32 in 0 .. 8191 = 0;
+    let mut nutzlang : u32 in 0 .. 1600 = 0;
+    let mut kopf_da : u32 in 0 .. 1 = 0;
+    let mut last_da : u32 in 0 .. 1 = 0;
+    let mut fehler : Zustand = 0;
+    -- Worst-case passes: (8192 - 20) / 4 = 2043 minimal attributes.
+    -- The emitter grants bounded / per-pass iterations (144 here); 300000
+    -- buys 2083, so on_exceeded is unreachable, not an expected event.
+    retry attr until versatz >= mlen
+        bounded 300000 ops
+        on_exceeded netz_streit
+        effects { reads Empfang, reads Empfang.slots }
+    {
+        -- M147: mlen was read before the walk, and the walk is the barrier --
+        -- re-read the length every pass (same bytes, fresh name).
+        let q0 : Einzelbyte = Empfang.slots[0].byte;
+        let q1 : Einzelbyte = Empfang.slots[1].byte;
+        let q2 : Einzelbyte = Empfang.slots[2].byte;
+        let q3 : Einzelbyte = Empfang.slots[3].byte;
+        let mlen_now : u32 = q0 + q1 * 256 + q2 * 65536 + q3 * 16777216;
+        let a : u32 = versatz;
+        narrow a to 0 .. 8188 else { fehler = 3; leave attr; }
+        let g0 : Einzelbyte = Empfang.slots[a].byte;
+        let g1 : Einzelbyte = Empfang.slots[a + 1].byte;
+        let g2 : Einzelbyte = Empfang.slots[a + 2].byte;
+        let g3 : Einzelbyte = Empfang.slots[a + 3].byte;
+        let alen : u32 in 0 .. 65535 = g0 + g1 * 256;
+        let atyp : u32 in 0 .. 65535 = g2 + g3 * 256;
+        if alen < 4 {
+            fehler = 3;
+            leave attr;
+        }
+        let ende : u32 = a + alen;
+        if ende > mlen_now {
+            fehler = 3;
+            leave attr;
+        }
+        if atyp == 1 {
+            if alen < 12 {
+                fehler = 4;
+                leave attr;
+            }
+            narrow a to 0 .. 8180 else { fehler = 3; leave attr; }
+            let k0 : Einzelbyte = Empfang.slots[a + 4].byte;
+            let k1 : Einzelbyte = Empfang.slots[a + 5].byte;
+            let k2 : Einzelbyte = Empfang.slots[a + 6].byte;
+            let k3 : Einzelbyte = Empfang.slots[a + 7].byte;
+            -- Packet id is big-endian: low-byte-first assembly, then swap.
+            let roh : u32 = k0 + k1 * 256 + k2 * 65536 + k3 * 16777216;
+            kennung = drehe32(roh);
+            haken = Empfang.slots[a + 10].byte;
+            kopf_da = 1;
+        } else {
+            if atyp == 10 {
+                let nlen : u32 = alen - 4;
+                if nlen < 1 {
+                    fehler = 5;
+                    leave attr;
+                }
+                let pv : u32 = a + 4;
+                narrow pv to 0 .. 8191 else { fehler = 3; leave attr; }
+                if nlen > 1600 {
+                    nutzlang = 1600;
+                } else {
+                    nutzlang = nlen;
+                }
+                nutzversatz = pv;
+                last_da = 1;
+            }
+        }
+        let neu : u32 = (ende + 3) / 4 * 4;
+        narrow neu to 0 .. 8192 else { fehler = 3; leave attr; }
+        versatz = neu;
+    }
+    -- M147 again: typ was read before the walk -- re-read it for the
+    -- error paths (the success write below only stores, which needs none).
+    let t0 : Einzelbyte = Empfang.slots[4].byte;
+    let t1 : Einzelbyte = Empfang.slots[5].byte;
+    let typ_now : u32 in 0 .. 65535 = t0 + t1 * 256;
+    if fehler != 0 {
+        return ergebnis_leer(fehler, typ_now);
+    }
+    if kopf_da == 0 {
+        return ergebnis_leer(4, typ_now);
+    }
+    if last_da == 0 {
+        return ergebnis_leer(5, typ_now);
+    }
+    Ergebnis.slots[0].zustand = 0;
+    Ergebnis.slots[0].kennung = kennung;
+    Ergebnis.slots[0].versatz = nutzversatz;
+    Ergebnis.slots[0].laenge = nutzlang;
+    Ergebnis.slots[0].reihung = reihung;
+    Ergebnis.slots[0].haken = haken;
+    Ergebnis.slots[0].typ = typ;
+    return 0;
+}
+
+}
