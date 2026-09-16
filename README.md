@@ -39,14 +39,16 @@ nft add rule inet filter input queue num 0-3 fanout
 | connection tracking (fixed hash table, states, timeouts) | **Gabbro** | `gab/verbindungen.gab` |
 | counters and statistics | **Gabbro** | `gab/zaehler.gab` |
 | the per-packet decision that ties them together | **Gabbro** | `gab/entscheidung.gab` |
-| sockets, NFQUEUE, thread creation, the verdict call | **C** | `treiber/` — see below |
+| the system calls: sockets, netlink, `mmap`, `clone`, `futex` | **Gabbro** | `gab/systemrufe.gab` |
+| the NFQUEUE netlink protocol and the verdict message | **Gabbro** | `gab/netzverbindung.gab` |
+| `main`, the worker threads, the receive loop | **Gabbro** | `gab/lauf.gab` |
 
-**Why the driver is C, stated plainly:** Gabbro has no syntax for starting a thread (measured
-2026-09-15: every shape refused), no standard library, and no dynamic memory. Thread creation,
-the netlink socket and the libnetfilter_queue calls therefore live in `treiber/`, exactly as the
-Gabbro tree's own runtime does (`muster/start-muster.c`). Every call across that border is an
-`extern fn` with a named assumption on the Gabbro side. *That border is the honest measure of
-what the language can carry today, and moving it is the point of the exercise.*
+**There is no C in this project.** The compiler emits C and `cc` compiles it — that is the
+compiler's business. Everything this program does to the outside world it does with a system
+call declared in Gabbro (number, register map, errno decoding, and a named assumption about what
+the kernel promises); the entry point is a Gabbro function called `main`; threads come from
+`clone`, memory from `mmap`, waiting from `futex`. *Where that turns out to be impossible, the
+impossibility is the finding, and it gets written down with the compiler's own words.*
 
 ## Constraints this project works under (all measured, not assumed)
 
@@ -63,7 +65,6 @@ what the language can carry today, and moving it is the point of the exercise.*
 
 ```
 gab/          the firewall, in Gabbro
-treiber/      the C driver: NFQUEUE, threads, verdicts
 werkzeug/     the Gabbro compiler used here
 doku/         the language and its grammar (copies)
 muster/       worked examples from the Gabbro tree, including its runtime

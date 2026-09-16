@@ -44,27 +44,51 @@ so both directions of a flow hash to the same bucket, plus a direction bit carri
 | `gab/verbindungen.gab` | the connection table, its hash, states, timeouts, its lock | decoding, rules |
 | `gab/zaehler.gab` | counters per verdict and per rule, atomics only | everything else |
 | `gab/entscheidung.gab` | the one function the driver calls per packet; calls the four above | the internals of any of them |
-| `treiber/*.c` | NFQUEUE, netlink, threads, verdict calls, the extern surface | any `.gab` file |
+| `gab/systemrufe.gab` | every `syscall` declaration: socket, bind, sendto, recvfrom, mmap, clone, futex, exit_group, clock_gettime | the modules above |
+| `gab/netzverbindung.gab` | the netlink/NFQUEUE protocol: config messages, parsing a packet out of a netlink message, building the verdict message | the modules above |
+| `gab/lauf.gab` | `main`, the buffers, the worker threads via `clone`, the receive loop, the rule file | the internals of any of them |
 
-## The border to C
+## There is no C. The border is the kernel ABI.
 
-Every C function the Gabbro side calls is an `extern fn` with a named assumption. Keep that list
-short and write it down in `messung/GRENZE.md`: each entry says what the C side promises and what
-happens if it breaks that promise.
-
-The driver calls exactly **one** Gabbro function per packet:
+**Nothing in this project is written in C.** The compiler emits C and `cc` compiles it, and that
+is the compiler's business, not ours. Everything this program does to the outside world it does
+with a **system call**, declared in Gabbro:
 
 ```
-pub impl fn entscheide(laenge : u32 in 0 .. 1600, faden : u32 in 0 .. 15) -> u32 in 0 .. 2
+syscall socket(domain : u64, typ : u64, proto : u64) -> u64 or NetzFehler
+    abi linux arch x86_64 number 41
+    regs in { rdi = domain, rsi = typ, rdx = proto }
+    regs out { rax }
+    clobbers { rcx, r11 }
+    errors { EAFNOSUPPORT => FamilieFehlt, EMFILE => ZuVieleDateien }
+    effects { pure }
+    assume linux_socket_contract falsifier sonde_socket;
 ```
 
-— the packet already lies in the `Paket` table, the worker's index is `faden`, and the answer is
-the verdict. Everything else is internal.
+That is the whole border: the number, the register map, the errno decoding, and a NAMED
+assumption about what the kernel promises. `beispiele/90-syscall-errno.gab` in `muster/` is the
+worked example; `doku/SYNTAX.md` §12.1 is the rule.
+
+**The entry point is a Gabbro function called `main`** — it emits `int32_t main(void)`, which is
+how this becomes a program you can run. Threads come from the `clone` system call, memory from
+`mmap`, waiting from `futex`, time from `clock_gettime`. No libc call is written by us.
+
+## What "the kernel part" means here
+
+Not a configuration frontend. **The deciding engine itself.** The kernel's netfilter hook hands
+every packet to this program over a netlink socket (NFQUEUE), and this program — decoding,
+rule matching, connection tracking, verdict — is what decides. The single `nft` line that
+attaches the hook is configuration, the way a cable is configuration.
+
+*The other reading of "the kernel part" is a loadable kernel module. That is a different
+project: the module skeleton is C macros and the kernel's own build system, and this one is
+about what Gabbro can carry on its own.*
 
 ## Order of work
 
 1. `pakete.gab` and `zaehler.gab` can start immediately — they depend on nothing.
 2. `regeln.gab` needs the `Kopf` shape above, not the decoder's code.
 3. `verbindungen.gab` needs the key rule above, not the decoder's code.
-4. `entscheidung.gab` comes last and is small: it is the wiring.
-5. `treiber/` runs in parallel with all of them — it needs only the one function signature.
+4. `systemrufe.gab` can start immediately — it is declarations, and it blocks the two below it.
+5. `netzverbindung.gab` needs the syscall signatures, not their bodies.
+6. `entscheidung.gab` and `lauf.gab` come last: they are the wiring.
