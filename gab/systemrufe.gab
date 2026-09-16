@@ -1,0 +1,621 @@
+-- gab/systemrufe.gab -- lane bm5: the border to the kernel, and nothing else.
+--
+-- Every other lane waits on these signatures. The file holds, in order:
+--   1. the shared error channel `NetzFehler` (a `reason`: one case per errno
+--      the border admits; the number at each case IS the errno, so the C
+--      side can compare);
+--   2. the published constants (numbers the kernel ABI fixes: families,
+--      clocks, futex operations, mapping flags, and the three sentinels
+--      the wrappers return instead of a reason -- see below);
+--   3. one `assume` per call naming what the kernel promises, each with its
+--      falsifier probe (`sonde_*`, `-> bool`, shape only -- BEFUNDE-bm5.md);
+--   4. the ten `syscall` items (number, register map, clobbers, error map).
+--
+-- The thin typed wrappers (`netz_socket`, ...) stand at the end of the file.
+--
+-- Two honest weakenings, both documented in messung/BEFUNDE-bm5.md and
+-- messung/BERICHT-bm5.md:
+--   a. a `pub` wrapper cannot carry `or NetzFehler` (the checker refuses it:
+--      `reason` takes no `pub`, N038). The wrappers therefore return `u64`
+--      and map every reason onto one of three sentinels: KEIN_WERT (terminal),
+--      NOCHMAL (EINTR/EAGAIN -- not a failure, call again), PAKETE_VERLOREN
+--      (ENOBUFS -- the kernel dropped packets, the operator must learn).
+--   b. every address and length crosses the border as `u64`. Gabbro cannot
+--      say "this number is a valid address"; the validity of every number
+--      handed to these wrappers is outside the language. Lengths and
+--      addresses at u64::max - 2 and above are outside the contract: the
+--      sentinels live there.
+module systemrufe {
+
+-- The error channel. Shared by all ten calls so that every lane matches
+-- against one closed list (`exhaustive`: a new case breaks every match,
+-- which is the point).
+reason NetzFehler {
+    Unterbrochen   = 4   "EINTR -- unterbrochen; kein Fehler, erneut rufen"
+    Wiederholen    = 11  "EAGAIN -- nichts zu tun oder Wert schon anders; kein Fehler, erneut pruefen"
+    KeinSpeicher   = 12  "ENOMEM -- kein Speicher"
+    PaketeVerloren = 105 "ENOBUFS -- der Kern hat Pakete verworfen; der Betrieb muss es erfahren"
+    FalscherWert   = 22  "EINVAL -- falscher Wert oder falsche Laenge"
+    SchlechterFd   = 9   "EBADF -- kein offener Dateizeiger"
+    FehlerAdresse  = 14  "EFAULT -- Adresse ausserhalb"
+    FamilieFehlt   = 97  "EAFNOSUPPORT -- Adressfamilie nicht getragen"
+    ProtokollFehlt = 93  "EPROTONOSUPPORT -- Protokoll nicht getragen"
+    ZuVieleDateien = 24  "EMFILE -- zu viele offene Dateizeiger in diesem Prozess"
+    SystemVoll     = 23  "ENFILE -- zu viele offene Dateizeiger im System"
+    Verboten       = 1   "EPERM -- nicht erlaubt (Faehigkeit fehlt)"
+    KeinZugriff    = 13  "EACCES -- Zugriff verweigert"
+    ZeitUm         = 110 "ETIMEDOUT -- Frist abgelaufen"
+    LeitungWeg     = 32  "EPIPE -- fernes Ende geschlossen"
+    exhaustive
+}
+
+-- Numbers the kernel ABI fixes (x86_64). Each stands here once so no lane
+-- writes a bare number into a call.
+pub const AF_NETLINKE     : u64 = 16;
+pub const SOCK_ROH        : u64 = 3;
+pub const NETLINKE_FILTER : u64 = 12;
+pub const FEHLER_AUSGABE  : u64 = 2;
+pub const UHR_MONOTON     : u64 = 1;
+pub const FUTEX_WARTEN    : u64 = 0;
+pub const FUTEX_WECKEN    : u64 = 1;
+pub const KARTE_SCHUTZ    : u64 = 3;
+pub const KARTE_ZEICHEN   : u64 = 34;
+pub const FADEN_TEILEN    : u64 = 253952;
+
+-- The three sentinels. A wrapper never returns a reason; it returns a value
+-- or one of these. Lengths and addresses at or above PAKETE_VERLOREN are
+-- outside the contract (see the file head).
+pub const KEIN_WERT       : u64 = u64::max;
+pub const NOCHMAL         : u64 = u64::max - 1;
+pub const PAKETE_VERLOREN : u64 = u64::max - 2;
+
+-- socket: the netlink socket. The firewall needs exactly one shape:
+-- AF_NETLINK (16), SOCK_RAW (3), NETLINK_NETFILTER (12); the wrapper
+-- `netz_socket` fixes it, the raw item takes the three numbers so the
+-- shape stays testable.
+assume linux_netz_socket_vertrag
+    "socket(16, 3, 12) liefert einen Dateizeiger auf einen NETLINK_NETFILTER-Kanal oder einen der genannten Fehler."
+    falsifier sonde_netz_socket;
+
+impl fn sonde_netz_socket() -> bool
+    effects { pure }
+    costs   <= 4 ops
+{
+    return true;
+}
+
+syscall roh_socket(gebiet : u64, typ : u64, protokoll : u64) -> u64 or NetzFehler
+    abi linux arch x86_64 number 41
+    regs in { rdi = gebiet, rsi = typ, rdx = protokoll }
+    regs out { rax }
+    clobbers { rcx, r11 }
+    errors { EAFNOSUPPORT => FamilieFehlt, EPROTONOSUPPORT => ProtokollFehlt,
+             EMFILE => ZuVieleDateien, ENFILE => SystemVoll, ENOMEM => KeinSpeicher,
+             EACCES => KeinZugriff, EINVAL => FalscherWert, EINTR => Unterbrochen }
+    effects { pure }
+    assume linux_netz_socket_vertrag falsifier sonde_netz_socket;
+
+-- bind: binding the netlink address.
+assume linux_netz_binden_vertrag
+    "bind(fd, adresse, laenge) bindet die Netlink-Adresse oder meldet einen der genannten Fehler."
+    falsifier sonde_netz_binden;
+
+impl fn sonde_netz_binden() -> bool
+    effects { pure }
+    costs   <= 4 ops
+{
+    return true;
+}
+
+syscall roh_binden(fd : u64, adresse : u64, laenge : u64) -> u64 or NetzFehler
+    abi linux arch x86_64 number 49
+    regs in { rdi = fd, rsi = adresse, rdx = laenge }
+    regs out { rax }
+    clobbers { rcx, r11 }
+    errors { EBADF => SchlechterFd, EINVAL => FalscherWert, EACCES => KeinZugriff,
+             ENOMEM => KeinSpeicher, EINTR => Unterbrochen, EAGAIN => Wiederholen }
+    effects { pure }
+    assume linux_netz_binden_vertrag falsifier sonde_netz_binden;
+
+-- sendto: configuration messages and every verdict. Six registers; the
+-- fourth goes in r10, not rcx -- that is the syscall/sysret shape.
+assume linux_netz_senden_vertrag
+    "sendto(fd, nachricht, laenge, zeichen, ziel, ziel_laenge) stellt zu oder meldet einen der genannten Fehler; ENOBUFS heisst: die Warteschlange des Kerns ist voll."
+    falsifier sonde_netz_senden;
+
+impl fn sonde_netz_senden() -> bool
+    effects { pure }
+    costs   <= 4 ops
+{
+    return true;
+}
+
+syscall roh_senden(fd : u64, nachricht : u64, laenge : u64, zeichen : u64, ziel : u64, ziel_laenge : u64) -> u64 or NetzFehler
+    abi linux arch x86_64 number 44
+    regs in { rdi = fd, rsi = nachricht, rdx = laenge, r10 = zeichen, r8 = ziel, r9 = ziel_laenge }
+    regs out { rax }
+    clobbers { rcx, r11 }
+    errors { EINTR => Unterbrochen, EAGAIN => Wiederholen, ENOBUFS => PaketeVerloren,
+             EBADF => SchlechterFd, EFAULT => FehlerAdresse, EINVAL => FalscherWert,
+             ENOMEM => KeinSpeicher, EACCES => KeinZugriff, EPIPE => LeitungWeg }
+    effects { pure }
+    assume linux_netz_senden_vertrag falsifier sonde_netz_senden;
+
+-- recvfrom: receiving queued packets. ENOBUFS here means the kernel dropped
+-- queued packets before we saw them -- the wrapper maps it to
+-- PAKETE_VERLOREN, never to a byte count.
+assume linux_netz_empfangen_vertrag
+    "recvfrom(fd, puffer, laenge, zeichen, quelle, quell_laenge) liefert die naechste Nachricht oder meldet einen der genannten Fehler; ENOBUFS heisst: der Kern hat eingereihte Pakete verworfen."
+    falsifier sonde_netz_empfangen;
+
+impl fn sonde_netz_empfangen() -> bool
+    effects { pure }
+    costs   <= 4 ops
+{
+    return true;
+}
+
+syscall roh_empfangen(fd : u64, puffer : u64, laenge : u64, zeichen : u64, quelle : u64, quell_laenge : u64) -> u64 or NetzFehler
+    abi linux arch x86_64 number 45
+    regs in { rdi = fd, rsi = puffer, rdx = laenge, r10 = zeichen, r8 = quelle, r9 = quell_laenge }
+    regs out { rax }
+    clobbers { rcx, r11 }
+    errors { EINTR => Unterbrochen, EAGAIN => Wiederholen, ENOBUFS => PaketeVerloren,
+             EBADF => SchlechterFd, EFAULT => FehlerAdresse, EINVAL => FalscherWert,
+             ENOMEM => KeinSpeicher }
+    effects { pure }
+    assume linux_netz_empfangen_vertrag falsifier sonde_netz_empfangen;
+
+-- mmap: the per-thread receive buffers and the thread stacks. Anonymous
+-- memory only in the wrapper (fd KEIN_WERT, i.e. -1); the raw item takes
+-- all six numbers.
+assume linux_speicher_karte_vertrag
+    "mmap(adresse, laenge, schutz, zeichen, fd, versatz) blendet Speicher ein oder meldet einen der genannten Fehler; die Antwort ist die Basisadresse."
+    falsifier sonde_speicher_karte;
+
+impl fn sonde_speicher_karte() -> bool
+    effects { pure }
+    costs   <= 4 ops
+{
+    return true;
+}
+
+syscall roh_karte(adresse : u64, laenge : u64, schutz : u64, zeichen : u64, fd : u64, versatz : u64) -> u64 or NetzFehler
+    abi linux arch x86_64 number 9
+    regs in { rdi = adresse, rsi = laenge, rdx = schutz, r10 = zeichen, r8 = fd, r9 = versatz }
+    regs out { rax }
+    clobbers { rcx, r11 }
+    errors { ENOMEM => KeinSpeicher, EINVAL => FalscherWert, EBADF => SchlechterFd,
+             EACCES => KeinZugriff, EAGAIN => Wiederholen, EPERM => Verboten }
+    effects { pure }
+    assume linux_speicher_karte_vertrag falsifier sonde_speicher_karte;
+
+-- clone: the worker threads. THE call that decides whether this project is
+-- possible -- see messung/BEFUNDE-bm5.md (Befund K-1): the declaration
+-- checks, the parent/child values are distinguishable in Gabbro, but the
+-- handoff "the child runs on the stack handed in rsi and must never return
+-- into the caller's frame" has no checked shape. The item below is the
+-- honest half: number, five registers, error map.
+assume linux_faden_start_vertrag
+    "clone(kind, stapel, eltern, kindspeicher, tls) erzeugt einen Faden; der Vater erhaelt die Kennung, das Kind 0 -- auf dem uebergebenen Stapel, in den kein Rahmen der Sprache zurueckkehren darf (BEFUNDE-bm5.md, Befund K-1)."
+    falsifier sonde_faden_start;
+
+impl fn sonde_faden_start() -> bool
+    effects { pure }
+    costs   <= 4 ops
+{
+    return true;
+}
+
+syscall roh_klonen(kind : u64, stapel : u64, eltern : u64, kindspeicher : u64, tls : u64) -> u64 or NetzFehler
+    abi linux arch x86_64 number 56
+    regs in { rdi = kind, rsi = stapel, rdx = eltern, r10 = kindspeicher, r8 = tls }
+    regs out { rax }
+    clobbers { rcx, r11 }
+    errors { EAGAIN => Wiederholen, ENOMEM => KeinSpeicher,
+             EINVAL => FalscherWert, EPERM => Verboten }
+    effects { pure }
+    assume linux_faden_start_vertrag falsifier sonde_faden_start;
+
+-- futex: waiting without spinning, where a lock must block. EAGAIN on
+-- FUTEX_WAIT means "the value already differs -- do not sleep", which is
+-- not a failure either: the caller re-checks instead of sleeping.
+assume linux_sperre_vertrag
+    "futex(adresse, vorgang, wert, frist) wartet oder weckt oder meldet einen der genannten Fehler; EAGAIN beim Warten heisst: der Wert liegt schon anders, nicht schlafen."
+    falsifier sonde_sperre;
+
+impl fn sonde_sperre() -> bool
+    effects { pure }
+    costs   <= 4 ops
+{
+    return true;
+}
+
+syscall roh_warten(adresse : u64, vorgang : u64, wert : u64, frist : u64) -> u64 or NetzFehler
+    abi linux arch x86_64 number 202
+    regs in { rdi = adresse, rsi = vorgang, rdx = wert, r10 = frist }
+    regs out { rax }
+    clobbers { rcx, r11 }
+    errors { EINTR => Unterbrochen, EAGAIN => Wiederholen, EINVAL => FalscherWert,
+             EFAULT => FehlerAdresse, ETIMEDOUT => ZeitUm }
+    effects { pure }
+    assume linux_sperre_vertrag falsifier sonde_sperre;
+
+-- clock_gettime: the connection timeouts.
+assume linux_zeit_lesen_vertrag
+    "clock_gettime(uhr, adresse) schreibt die Zeit an die Adresse oder meldet einen der genannten Fehler."
+    falsifier sonde_zeit_lesen;
+
+impl fn sonde_zeit_lesen() -> bool
+    effects { pure }
+    costs   <= 4 ops
+{
+    return true;
+}
+
+syscall roh_uhr(uhr : u64, adresse : u64) -> u64 or NetzFehler
+    abi linux arch x86_64 number 228
+    regs in { rdi = uhr, rsi = adresse }
+    regs out { rax }
+    clobbers { rcx, r11 }
+    errors { EINVAL => FalscherWert, EFAULT => FehlerAdresse }
+    effects { pure }
+    assume linux_zeit_lesen_vertrag falsifier sonde_zeit_lesen;
+
+-- exit_group: shutting down. The call never returns, so there is no failure
+-- it can report -- but the declaration still carries `or NetzFehler` with
+-- one unreachable EINTR arm. Without it the emitter writes a stub the C
+-- side cannot call (missing out-parameter at the call site), and with an
+-- empty map it writes a stub `-Werror` refuses (unused `_grund`); both are
+-- emitter bugs, filed in messung/BEFUNDE-bm5.md (Befunde E-1, E-2). The arm
+-- is dead by kernel semantics: exit_group does not return.
+assume linux_anhalten_vertrag
+    "exit_group(status) beendet alle Faeden mit dem Status und kehrt nie zurueck."
+    falsifier sonde_anhalten;
+
+impl fn sonde_anhalten() -> bool
+    effects { pure }
+    costs   <= 4 ops
+{
+    return true;
+}
+
+syscall roh_ende(status : u64) -> u64 or NetzFehler
+    abi linux arch x86_64 number 231
+    regs in { rdi = status }
+    regs out { rax }
+    clobbers { rcx, r11 }
+    errors { EINTR => Unterbrochen }
+    effects { pure }
+    assume linux_anhalten_vertrag falsifier sonde_anhalten;
+
+-- write: statistics on stderr. The wrapper `bericht_schreiben` fixes fd 2;
+-- the raw item takes the fd so the shape stays testable.
+assume linux_bericht_schreiben_vertrag
+    "write(fd, puffer, laenge) schreibt oder meldet einen der genannten Fehler; EPIPE heisst: das ferne Ende ist geschlossen."
+    falsifier sonde_bericht_schreiben;
+
+impl fn sonde_bericht_schreiben() -> bool
+    effects { pure }
+    costs   <= 4 ops
+{
+    return true;
+}
+
+syscall roh_schreiben(fd : u64, puffer : u64, laenge : u64) -> u64 or NetzFehler
+    abi linux arch x86_64 number 1
+    regs in { rdi = fd, rsi = puffer, rdx = laenge }
+    regs out { rax }
+    clobbers { rcx, r11 }
+    errors { EINTR => Unterbrochen, EAGAIN => Wiederholen, EBADF => SchlechterFd,
+             EFAULT => FehlerAdresse, EINVAL => FalscherWert, ENOMEM => KeinSpeicher,
+             EPIPE => LeitungWeg }
+    effects { pure }
+    assume linux_bericht_schreiben_vertrag falsifier sonde_bericht_schreiben;
+
+-- The thin typed wrappers. Nobody else touches a register map: each lane
+-- calls these. Every fallible wrapper makes one attempt and maps the closed
+-- reason list onto the three sentinels (see the file head):
+--   Unterbrochen, Wiederholen -> NOCHMAL (not a failure: call again);
+--   PaketeVerloren            -> PAKETE_VERLOREN (the operator must learn);
+--   everything else           -> KEIN_WERT (terminal, detail stays inside).
+-- No wrapper carries `costs`: a call to a `syscall` item declares none, and
+-- a promise over an unknown quantity is refused (K003). The contract the
+-- caller keeps instead is written at each wrapper.
+
+pub impl fn netz_socket() -> u64
+    effects { pure }
+{
+    let v = roh_socket(AF_NETLINKE, SOCK_ROH, NETLINKE_FILTER) else (e) {
+        match e {
+            Unterbrochen => { return NOCHMAL; }
+            Wiederholen => { return NOCHMAL; }
+            KeinSpeicher => { return KEIN_WERT; }
+            PaketeVerloren => { return PAKETE_VERLOREN; }
+            FalscherWert => { return KEIN_WERT; }
+            SchlechterFd => { return KEIN_WERT; }
+            FehlerAdresse => { return KEIN_WERT; }
+            FamilieFehlt => { return KEIN_WERT; }
+            ProtokollFehlt => { return KEIN_WERT; }
+            ZuVieleDateien => { return KEIN_WERT; }
+            SystemVoll => { return KEIN_WERT; }
+            Verboten => { return KEIN_WERT; }
+            KeinZugriff => { return KEIN_WERT; }
+            ZeitUm => { return KEIN_WERT; }
+            LeitungWeg => { return KEIN_WERT; }
+        }
+    }
+    return v;
+}
+
+pub impl fn netz_binden(fd : u64, adresse : u64, laenge : u64) -> u64
+    effects { pure }
+{
+    let v = roh_binden(fd, adresse, laenge) else (e) {
+        match e {
+            Unterbrochen => { return NOCHMAL; }
+            Wiederholen => { return NOCHMAL; }
+            KeinSpeicher => { return KEIN_WERT; }
+            PaketeVerloren => { return PAKETE_VERLOREN; }
+            FalscherWert => { return KEIN_WERT; }
+            SchlechterFd => { return KEIN_WERT; }
+            FehlerAdresse => { return KEIN_WERT; }
+            FamilieFehlt => { return KEIN_WERT; }
+            ProtokollFehlt => { return KEIN_WERT; }
+            ZuVieleDateien => { return KEIN_WERT; }
+            SystemVoll => { return KEIN_WERT; }
+            Verboten => { return KEIN_WERT; }
+            KeinZugriff => { return KEIN_WERT; }
+            ZeitUm => { return KEIN_WERT; }
+            LeitungWeg => { return KEIN_WERT; }
+        }
+    }
+    return v;
+}
+
+pub impl fn netz_senden(fd : u64, nachricht : u64, laenge : u64, zeichen : u64, ziel : u64, ziel_laenge : u64) -> u64
+    effects { pure }
+{
+    let v = roh_senden(fd, nachricht, laenge, zeichen, ziel, ziel_laenge) else (e) {
+        match e {
+            Unterbrochen => { return NOCHMAL; }
+            Wiederholen => { return NOCHMAL; }
+            KeinSpeicher => { return KEIN_WERT; }
+            PaketeVerloren => { return PAKETE_VERLOREN; }
+            FalscherWert => { return KEIN_WERT; }
+            SchlechterFd => { return KEIN_WERT; }
+            FehlerAdresse => { return KEIN_WERT; }
+            FamilieFehlt => { return KEIN_WERT; }
+            ProtokollFehlt => { return KEIN_WERT; }
+            ZuVieleDateien => { return KEIN_WERT; }
+            SystemVoll => { return KEIN_WERT; }
+            Verboten => { return KEIN_WERT; }
+            KeinZugriff => { return KEIN_WERT; }
+            ZeitUm => { return KEIN_WERT; }
+            LeitungWeg => { return KEIN_WERT; }
+        }
+    }
+    return v;
+}
+
+pub impl fn netz_empfangen(fd : u64, puffer : u64, laenge : u64, zeichen : u64, quelle : u64, quell_laenge : u64) -> u64
+    effects { pure }
+{
+    let v = roh_empfangen(fd, puffer, laenge, zeichen, quelle, quell_laenge) else (e) {
+        match e {
+            Unterbrochen => { return NOCHMAL; }
+            Wiederholen => { return NOCHMAL; }
+            KeinSpeicher => { return KEIN_WERT; }
+            PaketeVerloren => { return PAKETE_VERLOREN; }
+            FalscherWert => { return KEIN_WERT; }
+            SchlechterFd => { return KEIN_WERT; }
+            FehlerAdresse => { return KEIN_WERT; }
+            FamilieFehlt => { return KEIN_WERT; }
+            ProtokollFehlt => { return KEIN_WERT; }
+            ZuVieleDateien => { return KEIN_WERT; }
+            SystemVoll => { return KEIN_WERT; }
+            Verboten => { return KEIN_WERT; }
+            KeinZugriff => { return KEIN_WERT; }
+            ZeitUm => { return KEIN_WERT; }
+            LeitungWeg => { return KEIN_WERT; }
+        }
+    }
+    return v;
+}
+
+-- Anonymous memory, read/write, private: the per-thread receive buffers and
+-- the thread stacks. fd KEIN_WERT is -1, as mmap demands for anonymous
+-- memory; the answer is the base address or a sentinel.
+pub impl fn speicher_karte(laenge : u64) -> u64
+    effects { pure }
+{
+    let v = roh_karte(0, laenge, KARTE_SCHUTZ, KARTE_ZEICHEN, KEIN_WERT, 0) else (e) {
+        match e {
+            Unterbrochen => { return NOCHMAL; }
+            Wiederholen => { return NOCHMAL; }
+            KeinSpeicher => { return KEIN_WERT; }
+            PaketeVerloren => { return PAKETE_VERLOREN; }
+            FalscherWert => { return KEIN_WERT; }
+            SchlechterFd => { return KEIN_WERT; }
+            FehlerAdresse => { return KEIN_WERT; }
+            FamilieFehlt => { return KEIN_WERT; }
+            ProtokollFehlt => { return KEIN_WERT; }
+            ZuVieleDateien => { return KEIN_WERT; }
+            SystemVoll => { return KEIN_WERT; }
+            Verboten => { return KEIN_WERT; }
+            KeinZugriff => { return KEIN_WERT; }
+            ZeitUm => { return KEIN_WERT; }
+            LeitungWeg => { return KEIN_WERT; }
+        }
+    }
+    return v;
+}
+
+-- Thin passthrough over clone. The caller hands kind (flags, e.g.
+-- FADEN_TEILEN), the top of a mapped stack, and the parent/tls numbers.
+-- The father gets the id, the child 0 -- and the child stands on the given
+-- stack, where no frame of this language may return (BEFUNDE-bm5.md, K-1).
+pub impl fn faden_start(kind : u64, stapel : u64, eltern : u64, kindspeicher : u64, tls : u64) -> u64
+    effects { pure }
+{
+    let v = roh_klonen(kind, stapel, eltern, kindspeicher, tls) else (e) {
+        match e {
+            Unterbrochen => { return NOCHMAL; }
+            Wiederholen => { return NOCHMAL; }
+            KeinSpeicher => { return KEIN_WERT; }
+            PaketeVerloren => { return PAKETE_VERLOREN; }
+            FalscherWert => { return KEIN_WERT; }
+            SchlechterFd => { return KEIN_WERT; }
+            FehlerAdresse => { return KEIN_WERT; }
+            FamilieFehlt => { return KEIN_WERT; }
+            ProtokollFehlt => { return KEIN_WERT; }
+            ZuVieleDateien => { return KEIN_WERT; }
+            SystemVoll => { return KEIN_WERT; }
+            Verboten => { return KEIN_WERT; }
+            KeinZugriff => { return KEIN_WERT; }
+            ZeitUm => { return KEIN_WERT; }
+            LeitungWeg => { return KEIN_WERT; }
+        }
+    }
+    return v;
+}
+
+-- FUTEX_WAIT with no timeout (frist 0): sleep while the word at `adresse`
+-- still holds `wert`. Wiederholen (EAGAIN) means "already different, do
+-- not sleep" -- the caller re-checks instead; hence NOCHMAL.
+pub impl fn sperre_warten(adresse : u64, wert : u64) -> u64
+    effects { pure }
+{
+    let v = roh_warten(adresse, FUTEX_WARTEN, wert, 0) else (e) {
+        match e {
+            Unterbrochen => { return NOCHMAL; }
+            Wiederholen => { return NOCHMAL; }
+            KeinSpeicher => { return KEIN_WERT; }
+            PaketeVerloren => { return PAKETE_VERLOREN; }
+            FalscherWert => { return KEIN_WERT; }
+            SchlechterFd => { return KEIN_WERT; }
+            FehlerAdresse => { return KEIN_WERT; }
+            FamilieFehlt => { return KEIN_WERT; }
+            ProtokollFehlt => { return KEIN_WERT; }
+            ZuVieleDateien => { return KEIN_WERT; }
+            SystemVoll => { return KEIN_WERT; }
+            Verboten => { return KEIN_WERT; }
+            KeinZugriff => { return KEIN_WERT; }
+            ZeitUm => { return KEIN_WERT; }
+            LeitungWeg => { return KEIN_WERT; }
+        }
+    }
+    return v;
+}
+
+-- FUTEX_WAKE: wake at most `anzahl` waiters on the word at `adresse`. The
+-- answer is the number woken.
+pub impl fn sperre_wecken(adresse : u64, anzahl : u64) -> u64
+    effects { pure }
+{
+    let v = roh_warten(adresse, FUTEX_WECKEN, anzahl, 0) else (e) {
+        match e {
+            Unterbrochen => { return NOCHMAL; }
+            Wiederholen => { return NOCHMAL; }
+            KeinSpeicher => { return KEIN_WERT; }
+            PaketeVerloren => { return PAKETE_VERLOREN; }
+            FalscherWert => { return KEIN_WERT; }
+            SchlechterFd => { return KEIN_WERT; }
+            FehlerAdresse => { return KEIN_WERT; }
+            FamilieFehlt => { return KEIN_WERT; }
+            ProtokollFehlt => { return KEIN_WERT; }
+            ZuVieleDateien => { return KEIN_WERT; }
+            SystemVoll => { return KEIN_WERT; }
+            Verboten => { return KEIN_WERT; }
+            KeinZugriff => { return KEIN_WERT; }
+            ZeitUm => { return KEIN_WERT; }
+            LeitungWeg => { return KEIN_WERT; }
+        }
+    }
+    return v;
+}
+
+-- The connection timeouts read UHR_MONOTON through this; the caller hands
+-- the clock id (usually UHR_MONOTON) and the address of two u64 words
+-- (seconds, nanoseconds) it owns. The answer is 0 or a sentinel.
+pub impl fn zeit_lesen(uhr : u64, adresse : u64) -> u64
+    effects { pure }
+{
+    let v = roh_uhr(uhr, adresse) else (e) {
+        match e {
+            Unterbrochen => { return NOCHMAL; }
+            Wiederholen => { return NOCHMAL; }
+            KeinSpeicher => { return KEIN_WERT; }
+            PaketeVerloren => { return PAKETE_VERLOREN; }
+            FalscherWert => { return KEIN_WERT; }
+            SchlechterFd => { return KEIN_WERT; }
+            FehlerAdresse => { return KEIN_WERT; }
+            FamilieFehlt => { return KEIN_WERT; }
+            ProtokollFehlt => { return KEIN_WERT; }
+            ZuVieleDateien => { return KEIN_WERT; }
+            SystemVoll => { return KEIN_WERT; }
+            Verboten => { return KEIN_WERT; }
+            KeinZugriff => { return KEIN_WERT; }
+            ZeitUm => { return KEIN_WERT; }
+            LeitungWeg => { return KEIN_WERT; }
+        }
+    }
+    return v;
+}
+
+-- Shutting down. The call never returns; the `return` lines below are dead
+-- code the emitter keeps and the kernel never gives back. The Unterbrochen
+-- arm is doubly dead (see the `roh_ende` comment above).
+pub impl fn anhalten(status : u64) -> u64
+    effects { pure }
+{
+    let v = roh_ende(status) else (e) {
+        match e {
+            Unterbrochen => { return status; }
+            Wiederholen => { return status; }
+            KeinSpeicher => { return status; }
+            PaketeVerloren => { return status; }
+            FalscherWert => { return status; }
+            SchlechterFd => { return status; }
+            FehlerAdresse => { return status; }
+            FamilieFehlt => { return status; }
+            ProtokollFehlt => { return status; }
+            ZuVieleDateien => { return status; }
+            SystemVoll => { return status; }
+            Verboten => { return status; }
+            KeinZugriff => { return status; }
+            ZeitUm => { return status; }
+            LeitungWeg => { return status; }
+        }
+    }
+    return v;
+}
+
+-- Statistics on stderr (fd 2). The caller hands the address and length of
+-- bytes it owns; the answer is the number written or a sentinel.
+pub impl fn bericht_schreiben(adresse : u64, laenge : u64) -> u64
+    effects { pure }
+{
+    let v = roh_schreiben(FEHLER_AUSGABE, adresse, laenge) else (e) {
+        match e {
+            Unterbrochen => { return NOCHMAL; }
+            Wiederholen => { return NOCHMAL; }
+            KeinSpeicher => { return KEIN_WERT; }
+            PaketeVerloren => { return PAKETE_VERLOREN; }
+            FalscherWert => { return KEIN_WERT; }
+            SchlechterFd => { return KEIN_WERT; }
+            FehlerAdresse => { return KEIN_WERT; }
+            FamilieFehlt => { return KEIN_WERT; }
+            ProtokollFehlt => { return KEIN_WERT; }
+            ZuVieleDateien => { return KEIN_WERT; }
+            SystemVoll => { return KEIN_WERT; }
+            Verboten => { return KEIN_WERT; }
+            KeinZugriff => { return KEIN_WERT; }
+            ZeitUm => { return KEIN_WERT; }
+            LeitungWeg => { return KEIN_WERT; }
+        }
+    }
+    return v;
+}
+
+}
