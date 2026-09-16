@@ -1,0 +1,270 @@
+-- gab/verbindungen.gab -- Verbindungstabelle (lane bm3).
+--
+-- Festmaschen-Hashtabelle mit 1024 Eimern zu je 4 Faechen (4096 Eintraege).
+-- Schluessel ist das kanonische 5-Tupel aus ARCHITEKTUR.md: das kleinere
+-- (Adresse, Port)-Paar steht vorn, damit beide Richtungen eines Flusses in
+-- denselben Eimer fallen; die Richtung traegt jede Funktion als Ortswert.
+--
+-- Entwurf, und warum er so steht:
+-- * Eimer x Faecher statt 4096 linearer Plaetze: die Suche fasst genau einen
+--   Eimer an (4 Vergleiche, konstante Kosten), statt 4096 Plaetze zu kehren.
+-- * EIN Schloss statt eines pro Eimergruppe: die Fussabdruckregel (E247)
+--   verlangt die Wache an der Signatur (`requires Held`), und eine Signatur
+--   nennt eine feste Menge -- welche Eimerwache gilt, hinge von den Daten ab.
+--   Gestaffelte Schlösser kauften Laufzeitnebenlaeufigkeit um den Preis,
+--   die gepruefte Disziplin zu verlassen; das steht hier nicht zum Verkauf.
+-- * VOLL heisst ABWEISEN, nicht vertreiben: ein voller Tisch nimmt keinen
+--   neuen Fluss mehr an (Antwort 0, Zaeher `voll` laeuft), statt den aeltesten
+--   zu werfen. Werfen liesse eine SYN-Flut fremde, bestehende Fluesse
+--   verdraengen; Abweisen schuetzt sie. Der Treiber faellt auf die Regeln
+--   zurueck (Vorgabe: DROP), also fail-closed.
+
+module brandmauer::verbindungen {
+
+-- Masse. Alle `pub`, weil die oeffentlichen Signaturen sie nennen (N038).
+pub const ANZAHL : u32 = 4096;
+pub const EIMER : u32 = 1024;
+pub const FACH : u32 = 4;
+pub const ABLAUF : u32 = 300;
+
+-- Zustaende: 0 frei, 1 NEU, 2 BESTEHEND, 3 SCHLIESSEND.
+pub table Verbindung count ANZAHL {
+    slot {
+        zustand : u32 in 0 .. 3,
+        adr_a : u32,
+        adr_b : u32,
+        port_a : u32 in 0 .. 65535,
+        port_b : u32 in 0 .. 65535,
+        iprot : u32 in 0 .. 255,
+        gesehen : u32,
+        hin : u32,
+        rueck : u32,
+    }
+}
+
+-- Stand: ein Platz, vier Zaehler. Unter derselben Wache wie die Tabelle,
+-- weil jede Schreibung unter ihr geschieht -- kein Atomik noetig.
+pub table Stand count 1 {
+    slot {
+        voll : u32,
+        neu : u32,
+        treffer : u32,
+        abgelaufen : u32,
+    }
+}
+
+pub lock VSPERRE protects { Verbindung, Stand } rank 0 held <= 1024 ops;
+
+-- Treffer pflegen: Zeitstempel, Richtungszaehler, Zustandswechsel.
+-- Nur von suche_oder_lege_an gerufen, unter derselben Wache.
+impl fn treffer_pflegen(s : index into Verbindung, richtung : u32,
+                        flaggen : u32 in 0 .. 255, jetzt : u32) -> u32 in 0 .. 3
+    requires Held(VSPERRE)
+    effects { reads Verbindung.slots, writes Verbindung.slots,
+              reads Stand.slots, writes Stand.slots, locks VSPERRE }
+    costs <= 48 ops
+{
+    Verbindung.slots[s].gesehen = jetzt;
+    if richtung == 0 {
+        if Verbindung.slots[s].hin < u32::max {
+            Verbindung.slots[s].hin += 1;
+        }
+    } else {
+        if Verbindung.slots[s].rueck < u32::max {
+            Verbindung.slots[s].rueck += 1;
+        }
+    }
+    -- Die Lesung steht NACH den Schreibungen (V4/M147): was folgt, ist frisch.
+    -- Entschieden wird VOR dem einen Schreiben, gelesen danach: die
+    -- Frischepruefung (M147) ist pfadunempfindlich -- ein Name, der nach
+    -- IRGENDEINEM Schreiben desselben Traegers noch handelt, faellt, auch
+    -- wenn das Schreiben auf seinem Pfad nie laeuft.
+    let z : u32 in 0 .. 3 = Verbindung.slots[s].zustand;
+    let mut neu_zustand : u32 in 0 .. 3 = z;
+    if z == 1 {
+        -- NEU + Antwort aus der Gegenrichtung = BESTEHEND.
+        if richtung == 1 {
+            neu_zustand = 2;
+        }
+    } else {
+        if z == 2 {
+            -- FIN oder RST schliesst: Maske 5 = 0x01 FIN | 0x04 RST.
+            let f : u32 = flaggen & 5;
+            if f != 0 {
+                neu_zustand = 3;
+            }
+        }
+    }
+    Verbindung.slots[s].zustand = neu_zustand;
+    let frisch : u32 in 0 .. 3 = Verbindung.slots[s].zustand;
+    if Stand.slots[0].treffer < u32::max {
+        Stand.slots[0].treffer += 1;
+    }
+    return frisch;
+}
+
+-- Fluss suchen oder anlegen. Antwortet den Zustand: 1 frisch angelegt,
+-- 2/3 gefunden, 0 kein Platz (voll abgewiesen -- siehe Kopf).
+pub impl fn suche_oder_lege_an(quelle : u32, ziel : u32,
+                               qport : u32 in 0 .. 65535,
+                               zport : u32 in 0 .. 65535,
+                               iprot : u32 in 0 .. 255,
+                               flaggen : u32 in 0 .. 255,
+                               jetzt : u32) -> u32 in 0 .. 3
+    requires Held(VSPERRE)
+    effects { reads Verbindung.slots, writes Verbindung.slots,
+              reads Stand.slots, writes Stand.slots, locks VSPERRE }
+    costs <= 512 ops
+{
+    -- Kanonik: das kleinere (Adresse, Port)-Paar vorn.
+    let mut a : u32 = quelle;
+    let mut b : u32 = ziel;
+    let mut pa : u32 in 0 .. 65535 = qport;
+    let mut pb : u32 in 0 .. 65535 = zport;
+    let mut richtung : u32 = 0;
+    if quelle > ziel {
+        a = ziel;
+        b = quelle;
+        pa = zport;
+        pb = qport;
+        richtung = 1;
+    } else {
+        if quelle == ziel {
+            if qport > zport {
+                a = ziel;
+                b = quelle;
+                pa = zport;
+                pb = qport;
+                richtung = 1;
+            }
+        }
+    }
+    let h : u32 = a ^ b ^ pa ^ pb ^ iprot;
+    let eimer : u32 = h % EIMER;
+    let mut frei : u32 = ANZAHL;
+
+    -- Fach 0.
+    let s0 : u32 = eimer * 4 + 0;
+    narrow s0 to 0 ..< ANZAHL else { return 0; }
+    if Verbindung.slots[s0].zustand != 0 {
+        if Verbindung.slots[s0].adr_a == a && Verbindung.slots[s0].adr_b == b && Verbindung.slots[s0].port_a == pa && Verbindung.slots[s0].port_b == pb && Verbindung.slots[s0].iprot == iprot {
+            return treffer_pflegen(s0, richtung, flaggen, jetzt);
+        }
+    } else {
+        if frei == ANZAHL {
+            frei = s0;
+        }
+    }
+
+    -- Fach 1.
+    let s1 : u32 = eimer * 4 + 1;
+    narrow s1 to 0 ..< ANZAHL else { return 0; }
+    if Verbindung.slots[s1].zustand != 0 {
+        if Verbindung.slots[s1].adr_a == a && Verbindung.slots[s1].adr_b == b && Verbindung.slots[s1].port_a == pa && Verbindung.slots[s1].port_b == pb && Verbindung.slots[s1].iprot == iprot {
+            return treffer_pflegen(s1, richtung, flaggen, jetzt);
+        }
+    } else {
+        if frei == ANZAHL {
+            frei = s1;
+        }
+    }
+
+    -- Fach 2.
+    let s2 : u32 = eimer * 4 + 2;
+    narrow s2 to 0 ..< ANZAHL else { return 0; }
+    if Verbindung.slots[s2].zustand != 0 {
+        if Verbindung.slots[s2].adr_a == a && Verbindung.slots[s2].adr_b == b && Verbindung.slots[s2].port_a == pa && Verbindung.slots[s2].port_b == pb && Verbindung.slots[s2].iprot == iprot {
+            return treffer_pflegen(s2, richtung, flaggen, jetzt);
+        }
+    } else {
+        if frei == ANZAHL {
+            frei = s2;
+        }
+    }
+
+    -- Fach 3.
+    let s3 : u32 = eimer * 4 + 3;
+    narrow s3 to 0 ..< ANZAHL else { return 0; }
+    if Verbindung.slots[s3].zustand != 0 {
+        if Verbindung.slots[s3].adr_a == a && Verbindung.slots[s3].adr_b == b && Verbindung.slots[s3].port_a == pa && Verbindung.slots[s3].port_b == pb && Verbindung.slots[s3].iprot == iprot {
+            return treffer_pflegen(s3, richtung, flaggen, jetzt);
+        }
+    } else {
+        if frei == ANZAHL {
+            frei = s3;
+        }
+    }
+
+    -- Kein Treffer: anlegen, oder abweisen wenn der Eimer voll ist.
+    narrow frei to 0 ..< ANZAHL else {
+        if Stand.slots[0].voll < u32::max {
+            Stand.slots[0].voll += 1;
+        }
+        return 0;
+    }
+    Verbindung.slots[frei].adr_a = a;
+    Verbindung.slots[frei].adr_b = b;
+    Verbindung.slots[frei].port_a = pa;
+    Verbindung.slots[frei].port_b = pb;
+    Verbindung.slots[frei].iprot = iprot;
+    Verbindung.slots[frei].gesehen = jetzt;
+    if richtung == 0 {
+        Verbindung.slots[frei].hin = 1;
+        Verbindung.slots[frei].rueck = 0;
+    } else {
+        Verbindung.slots[frei].hin = 0;
+        Verbindung.slots[frei].rueck = 1;
+    }
+    Verbindung.slots[frei].zustand = 1;
+    if Stand.slots[0].neu < u32::max {
+        Stand.slots[0].neu += 1;
+    }
+    return 1;
+}
+
+-- Eintraege austragen, die aelter als ABLAUF sind. Wer die Uhr zurueckdreht
+-- (`jetzt < gesehen`), behaelt den Eintrag -- kein Austrag ins Ungewisse.
+pub impl fn altere(jetzt : u32)
+    requires Held(VSPERRE)
+    effects { reads Verbindung, reads Verbindung.slots, writes Verbindung.slots,
+              reads Stand.slots, writes Stand.slots, locks VSPERRE }
+    costs <= 90112 ops
+{
+    traverse k over slots of Verbindung by unvisited
+        touches reads Verbindung.slots, writes Verbindung.slots,
+                reads Stand.slots, writes Stand.slots
+    {
+        if Verbindung.slots[k].zustand != 0 {
+            if jetzt >= Verbindung.slots[k].gesehen {
+                let alter : u32 = jetzt - Verbindung.slots[k].gesehen;
+                if alter > ABLAUF {
+                    Verbindung.slots[k].zustand = 0;
+                    if Stand.slots[0].abgelaufen < u32::max {
+                        Stand.slots[0].abgelaufen += 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
+-- Stand lesen: 0 voll abgewiesen, 1 neu angelegt, 2 Treffer, 3 abgelaufen.
+-- Fuer den Treiber, unter derselben Wache gerufen.
+pub impl fn lies_stand(w : u32 in 0 .. 3) -> u32
+    requires Held(VSPERRE)
+    effects { reads Stand.slots, locks VSPERRE }
+    costs <= 8 ops
+{
+    if w == 0 {
+        return Stand.slots[0].voll;
+    }
+    if w == 1 {
+        return Stand.slots[0].neu;
+    }
+    if w == 2 {
+        return Stand.slots[0].treffer;
+    }
+    return Stand.slots[0].abgelaufen;
+}
+
+}
