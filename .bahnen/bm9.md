@@ -1,0 +1,11 @@
+YOUR MODULE: the WIRING ACROSS UNITS — `gab/entscheidung.gab` plus the accessors it needs, and one security finding to repair. Eight modules exist in your clone; seven check clean and `gab/entscheidung.gab` does not. Two things must land, both measured.
+
+**1. Cross-unit access.** The decision module reads `Kopf.slots[0].proto` — a table that lives in `gab/pakete.gab` — and the checker answers `[M119] Kopf is declared nowhere`, because a unit sees only its own declarations. The `use` route is closed (`messung/BEFUNDE-bm7.md` L-4); what works is the shape lane bm7 already used: an `extern fn` mirror with a C-identical prototype.
+
+So: give `gab/pakete.gab` the accessors the decision needs — one `pub impl fn` per field of `Kopf`, or one indexed reader, your choice with the reason written down — and mirror them in `gab/entscheidung.gab`. **You may edit `gab/pakete.gab` for this and for nothing else**; do not change its decoding logic, and say in the report exactly which lines you added.
+
+Then make `gabbro pruefe gab/entscheidung.gab` clean, emit every module, and **link the whole firewall**: `lauf.gab`, `entscheidung.gab`, `pakete.gab`, `regeln.gab`, `verbindungen.gab`, `zaehler.gab`, `netzverbindung.gab`, `systemrufe.gab` into one binary with `cc -std=c11 -Wall -Wextra -Werror` at -O0 and -O2. Report the exact command and its output. **That link is the deliverable** — eight units, one program.
+
+**2. The security finding from lane bm8, F5, and it is a real hole.** `suche_oder_lege_an` answers the state AFTER the transition, so the packet that promotes a flow from NEW to ESTABLISHED already answers ESTABLISHED — and under the fast path that packet **never sees the rules**. A firewall in which the second packet of a flow skips the rule set is not a firewall. Repair it in `gab/entscheidung.gab` (the fast path is yours): the rules must decide for every packet that is not yet part of an ESTABLISHED flow *before* this packet, and the report must show the measurement that the repaired order gives — a NEW packet and its promoting reply both walked against the rules, an established flow's third packet taking the fast path.
+
+Write `messung/BERICHT-bm9.md` with: the accessor shape and why, the link command and its output, the F5 repair with before/after behaviour, every refusal met verbatim, and what you did not measure.
