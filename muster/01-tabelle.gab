@@ -1,0 +1,184 @@
+-- 01 -- `table`: eine Datenstruktur mit Invarianten und erzeugten Mutationen.
+--
+-- Der Zuschnitt entscheidet sich an EINER Zeile: eine `table` MIT `ops` laesst keine
+-- handgeschriebene Mutation mehr zu (der Erzeuger zeigt die Erhaltung einmal ueber der
+-- Deklaration), eine OHNE ist reine Beschreibung. Beides ist dieselbe Syntax -- der
+-- Unterschied ist sichtbar gewaehlt statt schleichend.
+
+module beispiel::tabelle {
+
+const NSLOTS   : u32 = 4096;
+const NOBJEKTE : u32 = 1024;
+
+-- **Der Indextyp wird ERZEUGT, nicht geschrieben.** `count` an der Tabelle gibt
+-- `index into Kappenraum` seine Schranke; frueher stand daneben ein handgeschriebenes
+-- `type SlotIdx = u32 in 0 ..< NSLOTS`, und nichts band die beiden aneinander.
+type Zaehler  = u32 in 0 .. 65535;
+
+opaque type Pa      = u64;
+opaque type EpId    = u32;
+opaque type FadenId = u32;
+
+tagged type ObjektArt = { Speicher(Pa), Endpunkt(EpId), Faden(FadenId), Antwort(EpId) };
+
+reason KappenFehler {
+    KeinSlot    = 1 "kein freier Slot mehr"
+    Ungueltig   = 2 "abgelaufenes Handle"
+    HatKinder   = 3 "erst die Nachfahren einsammeln"
+    exhaustive
+}
+
+lock KAPPEN protects { eintraege, baum } rank 0 held <= 400 ops masks irqs;
+
+-- Zweite Tabelle: `table` kennt genau EIN `slot`-Wort, und die Verbindung zwischen
+-- beiden traegt `index into` -- ein Index, dessen Schranke aus der Deklaration faellt.
+table Objekte count NOBJEKTE {
+    slot {
+        benutzt : bool,
+        marke   : u32 wrapping,
+        art     : ObjektArt,
+        zaehler : Zaehler,
+    }
+}
+
+table Kappenraum count NSLOTS {
+    const WURZEL : u32 = 0;
+
+    -- **«B41b»: die Kante, an der `descendants of` laeuft** (2026-08-20). Sie stand bis
+    -- heute nirgends -- der Slot fuehrt VIER Kandidaten (`elter`, `erstes_kind`,
+    -- `naechstes`, `vorheriges`), und die Domaene nannte keinen. Gefunden hat es der
+    -- ERZEUGER beim Absenken, nicht der Entwurf: *„that is an asymmetry in the grammar, not
+    -- missing emitter code."*
+    --
+    -- Sie steht an der TABELLE und nicht am Durchlauf, weil ein Baum an vielen Stellen
+    -- durchlaufen wird und zwei Stellen sonst verschiedene Felder nennen koennten, ohne dass
+    -- jemand die beiden vergleicht. `D006`-`D008` halten sie gegen den Slot.
+    tree { parent elter, child erstes_kind, sibling naechstes }
+
+    slot {
+        benutzt      : bool,
+        marke        : u32 wrapping,
+        objekt       : index into Objekte,
+        abzeichen    : u64,
+        elter        : option index into Kappenraum,
+        erstes_kind  : option index into Kappenraum,
+        naechstes    : option index into Kappenraum,
+        vorheriges   : option index into Kappenraum,
+    }
+
+    invariant wurzel_ohne_vorgaenger cost O(n) runs offline :
+        forall s in slots of Self : Self.slots[s].elter == None
+            => Self.slots[s].vorheriges == None;
+
+    -- Ohne `ops` ist diese Tabelle Zuschnitt (a): reine Beschreibung mit erzeugtem
+    -- Pruefer. Mit `ops insert, remove;` waere jede Handmutation unten ein Fehler --
+    -- der Unterschied ist eine Zeile und damit sichtbar gewaehlt.
+    invariant baum_bleibt_baum cost O(n) runs offline
+        by induction over descendants of Self :
+        forall s in slots of Self : Self.slots[s] reaches WURZEL via elter;
+}
+
+spec fn ist_blatt(c : ptr<normal, r> Kappenraum, s : index into Kappenraum) -> bool
+    effects { pure }
+    = c.slots[s].benutzt && c.slots[s].erstes_kind == None;
+
+spec fn baum_wohlgeformt(c : ptr<normal, r> Kappenraum) -> bool
+    effects { pure }
+    = forall s in slots of c : c.slots[s] reaches WURZEL via elter;
+
+impl fn aushaengen(c : ptr<normal, rw> Kappenraum, s : index into Kappenraum)
+    requires  Held(KAPPEN), c.slots[s].benutzt
+    ensures   c.slots[s].elter == None,
+              c.slots[s].vorheriges == None,
+              c.slots[s].naechstes == None
+    maintains baum_wohlgeformt
+    effects   { writes c.slots, locks KAPPEN }
+    costs     <= 40 ops
+{
+    match c.slots[s].vorheriges {
+        Some(p) => { c.slots[p].naechstes = c.slots[s].naechstes; }
+        None     => {
+            match c.slots[s].elter {
+                Some(e) => { c.slots[e].erstes_kind = c.slots[s].naechstes; }
+                None     => { }
+            }
+        }
+    }
+    match c.slots[s].naechstes {
+        Some(n) => { c.slots[n].vorheriges = c.slots[s].vorheriges; }
+        None     => { }
+    }
+    c.slots[s].elter      = None;
+    c.slots[s].erstes_kind = None;
+    c.slots[s].naechstes  = None;
+    c.slots[s].vorheriges = None;
+}
+
+-- `by consuming` traegt Terminierung UND Blattheit: die Domaene liefert ihre Zeugen in
+-- der von der Struktur erzeugten Ordnung, tiefenfallend. Der Rumpf schrumpft auf eine Zeile.
+impl fn einsammeln(c : ptr<normal, rw> Kappenraum,
+                   o : ptr<normal, rw> Objekte,
+                   s : index into Kappenraum)
+    requires  Held(KAPPEN), baum_wohlgeformt(c)
+    maintains baum_wohlgeformt
+    effects   { consumes c.slots, writes o.slots, locks KAPPEN }
+    -- **Diese Zahl kommt aus dem Kostenpass, nicht aus einer Schaetzung.** Eine
+    -- Traversierung zaehlt Rumpfkosten x Domaenenschranke: NSLOTS Slots mal die 200 ops,
+    -- die `blatt_loeschen` zusagt, plus die drei Ladevorgaenge des Aufrufs, plus die
+    -- Invariante `c.slots[s].benutzt` an jeder Durchgangsgrenze (Lane 139, F6).
+    -- **839680 seit dem 2026-09-13.** Wer sie kleiner will, aendert den Rumpf --
+    -- nicht die Zusage.
+    costs     <= 839680 ops
+    by        induction over descendants of s
+{
+    -- **Was ueber den Durchlaeufen gilt.** Das MASS traegt `by consuming` schon; dies ist
+    -- die AUSSAGE, und bis zum 2026-08-28 hatte die Sprache kein Wort dafuer
+    -- (`messung/SCHLEIFENINVARIANTE.md`). `invariant` ist kein neues Wort: es steht an einer
+    -- `table` fuer dasselbe -- ein Praedikat, das durchgehend gilt.
+    traverse opfer over descendants of c.slots[s] by consuming
+        touches consumes c.slots, writes o.slots
+        invariant c.slots[s].benutzt
+    {
+        blatt_loeschen(c, o, opfer);
+    }
+}
+
+impl fn blatt_loeschen(c : ptr<normal, rw> Kappenraum,
+                       o : ptr<normal, rw> Objekte,
+                       s : index into Kappenraum)
+    requires  Held(KAPPEN), c.slots[s].benutzt, ist_blatt(c, s)
+    ensures   !c.slots[s].benutzt
+    maintains baum_wohlgeformt
+    effects   { writes c.slots, writes o.slots, locks KAPPEN }
+    costs     <= 200 ops
+{
+    aushaengen(c, s);
+    c.slots[s].marke   += 1;
+    c.slots[s].benutzt  = false;
+
+    -- Die Lesung steht NACH den Schreibungen (V4): `aushaengen` und die beiden
+    -- Schreibungen nennen den Traeger `c`, ein frueheres `obj` waere danach
+    -- veraltet. `.objekt` hat keine davon angeruehrt, daher ist dies dieselbe
+    -- Entscheidung ueber denselben Wert -- nur mit frischem Namen.
+    let obj = c.slots[s].objekt;
+
+    -- Die Buchfuehrung: der Zaehler faellt nur, wenn er oben ist. Ohne die Pruefung
+    -- verlaesst `- 1` den Bereich von `Zaehler` -- M1 sagt das, nicht ein Testlauf.
+    if o.slots[obj].zaehler >= 1 {
+        o.slots[obj].zaehler -= 1;
+    }
+
+    if o.slots[obj].zaehler == 0 {
+        match o.slots[obj].art {
+            Speicher(p)  => { speicher_freigeben(p); }
+            Endpunkt(e)  => { }
+            Faden(f)     => { }
+            Antwort(a)   => { }
+        }
+        o.slots[obj].benutzt = false;
+    }
+}
+
+extern fn speicher_freigeben(p : Pa) effects { writes halde } costs <= 64 ops;
+
+}

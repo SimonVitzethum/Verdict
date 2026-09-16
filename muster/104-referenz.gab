@@ -1,0 +1,56 @@
+-- 104 -- The reference fixture as a real Gabbro program (lane 126).
+--
+-- This is `grammatik/Grammatik/ReferenzB.lean` (`refD`/`refP`) in surface
+-- syntax: one table `Konto` of 2 slots with one `0 .. 100` field, guarded by
+-- the single lock `M`; `einzahlen` (one `0 .. 10` parameter, no result,
+-- writes the table, ensures the slot did not decrease) and `lies` (no
+-- parameters, one `0 .. 100` result, reads, ensures the answer equals the
+-- slot). Both run under the held lock (`requires Held(M)`, the `beispiele/01`
+-- idiom: the caller's duty, so the bodies touch the guarded slot directly).
+-- Not declared `concurrent`: both functions hold `M` by signature, and the
+-- start rule N240 (the goal theorem's `StartExklusiv`) forbids two threads
+-- starting in functions that share a signature lock. The earlier note: the declaration
+-- (lane 141: the certificate census classifies `concurrent` as erased -- the
+-- emitter writes nothing for it -- so the declaration passes stage 7 of
+-- `pruefe-emission.sh`). Threads cannot be driven from a C driver anyway, so
+-- the driver runs both threads one after the other -- the sequential
+-- composition the emitter produces: `einzahlen` like thread 1, then `lies`
+-- like thread 0. That is the observable half of the fixture
+-- (`refB_schreibt`: slot `0 -> 100`).
+
+module beispiel::referenz {
+
+const NKONTO : u32 = 2;
+
+type Betrag = u32 in 0 .. 10;
+type Stand = u32 in 0 .. 100;
+
+table Konto count NKONTO {
+    slot {
+        stand : Stand,
+    }
+}
+
+lock M protects { stand } rank 0 held <= 50 ops;
+
+impl fn einzahlen(k : ptr<normal, rw> Konto, i : index into Konto, b : Betrag)
+    requires Held(M)
+    ensures  old(k.slots[i].stand) <= k.slots[i].stand
+    effects  { reads k.slots, writes k.slots, locks M }
+    costs    <= 16 ops
+{
+    k.slots[i].stand = 100;
+    lies(k, i);
+}
+
+impl fn lies(k : ptr<normal, r> Konto, i : index into Konto) -> Stand
+    requires Held(M)
+    ensures  result == k.slots[i].stand
+    effects  { reads k.slots, locks M }
+    costs    <= 8 ops
+{
+    return k.slots[i].stand;
+}
+
+
+}

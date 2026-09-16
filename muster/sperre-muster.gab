@@ -1,0 +1,74 @@
+-- laufzeit/sperre.gab -- THE RUNTIME'S TICKET LOCK, WRITTEN IN GABBRO.
+--
+-- The shape of `grammatik/Grammatik/CTicket.lean`: two counters (`next`,
+-- `now`); `nimm` draws a ticket with a fetch-add (relaxed) then spins until
+-- the served ticket is its own (acquire); `gib` advances the served counter
+-- (release). The counters are 32-bit words that wrap: the Lean model
+-- (`CTicket.lean` CUTS) is the implementation as long as fewer than 2^32
+-- tickets are outstanding for one lock.
+--
+-- Where the checker refuses this file, the refusal is the finding: it says
+-- what the language cannot yet express about its own runtime.
+
+module laufzeit::sperre {
+
+-- The ticket dispenser. Drawn with fetch-add, so `relaxed`: drawing takes
+-- no synchronisation, only a distinct number.
+atomic NEXT : u32 relaxed;
+
+-- The ticket now served. Spun on with `acquire` (entering the critical
+-- section synchronises with the releaser), advanced with `release`.
+atomic NOW : u32 acquire;
+
+-- Wrapping successor on a 32-bit word. A parameter (not a `let` local
+-- and not an `exchange` binder) is what the emitter reads the exact range
+-- off: locals and binders lower as plain C names without a declaration to
+-- read, so `+%` over them is refused by name. The emitted C is
+-- `(uint32_t)(x + 1)` -- C's unsigned arithmetic IS modulo 2^32.
+impl fn folge(x : u32) -> u32
+    effects { pure }
+    costs   <= 2 ops
+{
+    return x +% 1;
+}
+
+-- The wait gives up by failing STOP: the overrun exit never returns, so
+-- `nimm` never comes back without holding the ticket. A bounded wait that
+-- returned anyway would hand out the lock to a thread whose ticket was
+-- never served -- that is Finding 2 of `CTicket.lean` (`gib_ohne_wache`)
+-- as a program.
+extern fn warte_aufgegeben() -> never effects { diverges };
+
+-- `L_nimm`: draw a ticket, spin until it is served.
+impl fn nimm()
+    effects { reads NEXT, writes NEXT, reads NOW }
+    costs   <= 4294967299 ops
+{
+    -- `zieht`: `my = fetch_add(&NEXT, 1)`, spelled as a bounded CAS loop
+    -- (the emitter has no `atomic_fetch_add` arm: every `exchange update`
+    -- lowers to load/compute/CAS-weak). The step function is `folge`, which
+    -- wraps at 2^32 like the C `unsigned`; a plain `t + 1` in the body would
+    -- leave the type at the top.
+    let my : u32 = NEXT exchange update(t)
+        bounded 64 ops
+        on_exceeded warte_aufgegeben
+    { return folge(t); } publishes nothing;
+    -- `dreht`/`tritt`: spin while `NOW != my`. Each pass re-reads `NOW`.
+    retry spin until NOW == my
+        bounded 4294967295 ops
+        on_exceeded warte_aufgegeben
+        effects { reads NOW }
+    {
+    }
+}
+
+-- `L_gib`: serve the next ticket. One load, one wrapping store.
+impl fn gib()
+    effects { reads NOW, writes NOW }
+    costs   <= 64 ops
+{
+    let n : u32 = NOW;
+    NOW = folge(n) publishes nothing;
+}
+
+}

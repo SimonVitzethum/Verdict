@@ -1,0 +1,62 @@
+-- 108 -- Two lock-free readers over one shared, never-written table.
+--
+-- TRANSFER of `StartExklusiv` (`RufMaschineG.lean`): the start functions of
+-- distinct threads hold no signature lock in common -- and since lane 183
+-- (`wurzelnB`) they hold NO signature lock at all: nobody holds a lock for a
+-- thread before it starts. This file used to show the disjoint shape
+-- (`read_a` under `Held(L)`, `read_c` under `Held(M)`); that shape is now
+-- refused at both starts (`N303`), and the take-inside remedy has no G form
+-- for value readers (`LG004`: no `return` under `locks`). What remains is
+-- the silent side both rules share: two readers over one table nobody
+-- writes -- every rule stays silent (`N240`/`N303`: nothing held; `N290`/
+-- `N291`/`N300`/`N301`: unwritten carriers; `W001`: reads overlap freely).
+-- The refused root shape lives in `beispiele/gift/967`, the pair side in
+-- gifts 910-915. The G export of this file is pinned in
+-- `grammatik/Grammatik/Export108.lean`.
+--
+-- Evidence: the pre-183 program this file replaces, kept verbatim as a
+-- comment. It is refused since lane 183 at both starts by `N303`
+-- (`wurzelnB`: `D.haelt w = []` -- nobody holds a lock for a thread before
+-- it starts), although `N240` stays silent on it (disjoint held sets):
+--   table U count 4 {
+--       slot { v : u32, }
+--   }
+--   lock L protects { T } rank 0 held <= 100 ops;
+--   lock M protects { U } rank 1 held <= 100 ops;
+--   impl fn read_a() -> u32
+--       requires Held(L)
+--       effects { reads T.slots }
+--       costs <= 4 ops
+--   {
+--       return T.slots[0].v;
+--   }
+--   impl fn read_c() -> u32
+--       requires Held(M)
+--       effects { reads U.slots }
+--       costs <= 4 ops
+--   {
+--       return U.slots[0].v;
+--   }
+module beispiel::disjoint_start_locks {
+
+table T count 4 {
+    slot { v : u32, }
+}
+
+impl fn read_a() -> u32
+    effects { reads T.slots }
+    costs <= 4 ops
+{
+    return T.slots[0].v;
+}
+
+impl fn read_c() -> u32
+    effects { reads T.slots }
+    costs <= 4 ops
+{
+    return T.slots[1].v;
+}
+
+concurrent { read_a, read_c };
+
+}

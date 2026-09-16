@@ -1,0 +1,33 @@
+-- 116 -- **A payload-free counter: `publishes nothing` at the store, a bare read
+-- at the load -- and the bare read is an explicit load, not a plain access.**
+--
+-- Until lane 152 the read below (`let n = ZAEHLER;`) checked clean and came
+-- out as `uint32_t n = ZAEHLER;` over `_Atomic uint32_t ZAEHLER` -- a plain
+-- access, which C treats as `seq_cst` while the declaration says `relaxed`.
+-- Now it lowers to `atomic_load_explicit(&ZAEHLER, memory_order_relaxed)`:
+-- the declared order, through the explicit call `C-SPEICHERMODELL.md` §1c
+-- demands for every atomic access. The store keeps its word
+-- (`publishes nothing`, held by V001-V004); the read names no payload because
+-- there is none -- the payload-free class (`SPRACHE.md` §1.1), not a missing
+-- pairing (`V009` stays silent: no branch over this value reads a foreign
+-- place).
+module beispiel116 {
+
+atomic ZAEHLER : u32 relaxed;
+
+impl fn melde(t : u32)
+    effects { writes ZAEHLER }
+    costs   <= 4 ops
+{
+    ZAEHLER = t publishes nothing;
+}
+
+impl fn lies() -> u32
+    effects { reads ZAEHLER }
+    costs   <= 4 ops
+{
+    let n : u32 = ZAEHLER;
+    return n;
+}
+
+}

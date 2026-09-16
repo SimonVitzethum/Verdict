@@ -1,0 +1,86 @@
+-- 124 -- **Two active threads with private tables and one shared lock (lane 175).**
+--
+-- The witness shape of `grammatik/Grammatik/MehrfadenZeuge.lean` in surface
+-- syntax: thread 0 (`hauptA`) writes its private table `privA` unguarded, thread 1
+-- (`hauptB`) its private table `privB` unguarded, and both update the shared table
+-- `konto` under the lock `L` with the non-trivial invariant
+-- `konto[0] == konto[1]`. Both earlier footprint checks refuse this program
+-- (`mP_fussG_falsch`, `mP_fussS_falsch`); the new one admits it (`mP_fussMehr`):
+-- the private carriers are thread-local, the shared carrier is invariant-protected.
+-- Every rule stays silent: N290-N293 (locality + invariant), N294 (no signature
+-- lock, hence no floor), N240 (empty held sets at both starts), W001 (both hulls
+-- carry `locks L`).
+module beispiel::two_threads_private {
+
+const NSLOTS : u32 = 2;
+
+type Stand = u32 in 0 .. 100;
+
+table konto count NSLOTS {
+    slot {
+        stand : Stand,
+    }
+}
+
+table privA count NSLOTS {
+    slot {
+        stand : Stand,
+    }
+}
+
+table privB count NSLOTS {
+    slot {
+        stand : Stand,
+    }
+}
+
+lock L protects { konto } rank 0 held <= 100 ops
+    invariant konto.slots[0].stand == konto.slots[1].stand;
+
+impl fn setze(x : Stand)
+    requires Held(L), konto.slots[0].stand == konto.slots[1].stand
+    ensures  konto.slots[0].stand == x
+    effects  { reads konto.slots, writes konto.slots, locks L }
+    costs    <= 64 ops
+{
+    konto.slots[0].stand = x;
+    konto.slots[1].stand = x;
+}
+
+impl fn pruefeA() -> Stand
+    requires privA.slots[0].stand == 7
+    ensures  result == 7
+    effects  { reads privA.slots }
+    costs    <= 64 ops
+{
+    return privA.slots[0].stand;
+}
+
+impl fn hauptA()
+    ensures  privA.slots[0].stand == 7
+    effects  { reads privA.slots, writes privA.slots, reads konto.slots,
+               writes konto.slots, locks L }
+    costs    <= 512 ops
+{
+    privA.slots[0].stand = 7;
+    privA.slots[1].stand = 7;
+    locks L {
+        setze(30);
+    }
+    pruefeA();
+}
+
+impl fn hauptB()
+    effects  { reads privB.slots, writes privB.slots, reads konto.slots,
+               writes konto.slots, locks L }
+    costs    <= 512 ops
+{
+    privB.slots[0].stand = 5;
+    locks L {
+        setze(70);
+    }
+}
+
+concurrent { hauptA, hauptB };
+
+}
