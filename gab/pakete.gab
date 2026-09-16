@@ -151,4 +151,70 @@ pub impl fn entpacke(laenge : u32 in 0 .. 1600) -> u32 in 0 .. 1
     return 1;
 }
 
+-- Cross-unit readers for the decoded header (lane bm9). `gab/entscheidung.gab`
+-- cannot name `Kopf` (a unit sees only its own declarations -- M119), and the
+-- `use` route stays inside the unit gate (BEFUNDE-bm7.md L-4). So the decision
+-- calls these instead, through `extern fn` mirrors with C-identical
+-- prototypes; the link resolves them. One reader per field (not one indexed
+-- reader): the fields carry different ranges, and per-field results keep
+-- those ranges at the call site -- an indexed reader would answer plain `u32`
+-- and force a `narrow` at every use. Ranges and effects below repeat the
+-- table declaration field for field; the decoding above is untouched.
+
+pub impl fn gib_kopf_gueltig() -> u32 in 0 .. 1
+    effects { reads Kopf, reads Kopf.slots }
+    costs <= 4 ops
+{
+    return Kopf.slots[0].gueltig;
+}
+
+pub impl fn gib_kopf_proto() -> u32 in 0 .. 255
+    effects { reads Kopf, reads Kopf.slots }
+    costs <= 4 ops
+{
+    return Kopf.slots[0].proto;
+}
+
+pub impl fn gib_kopf_quelle() -> u32
+    effects { reads Kopf, reads Kopf.slots }
+    costs <= 4 ops
+{
+    return Kopf.slots[0].quelle;
+}
+
+pub impl fn gib_kopf_ziel() -> u32
+    effects { reads Kopf, reads Kopf.slots }
+    costs <= 4 ops
+{
+    return Kopf.slots[0].ziel;
+}
+
+pub impl fn gib_kopf_qport() -> u32 in 0 .. 65535
+    effects { reads Kopf, reads Kopf.slots }
+    costs <= 4 ops
+{
+    return Kopf.slots[0].qport;
+}
+
+pub impl fn gib_kopf_zport() -> u32 in 0 .. 65535
+    effects { reads Kopf, reads Kopf.slots }
+    costs <= 4 ops
+{
+    return Kopf.slots[0].zport;
+}
+
+pub impl fn gib_kopf_flaggen() -> u32 in 0 .. 255
+    effects { reads Kopf, reads Kopf.slots }
+    costs <= 4 ops
+{
+    return Kopf.slots[0].flaggen;
+}
+
+pub impl fn gib_kopf_laenge() -> u32 in 0 .. 65535
+    effects { reads Kopf, reads Kopf.slots }
+    costs <= 4 ops
+{
+    return Kopf.slots[0].laenge;
+}
+
 }
