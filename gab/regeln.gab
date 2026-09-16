@@ -1,0 +1,179 @@
+-- gab/regeln.gab -- lane bm2: the rule table and the match.
+--
+-- A firewall is its rules: a fixed table `Regel count 256`. Each slot carries
+-- a match (protocol, source address and mask, destination address and mask,
+-- source port range, destination port range, TCP flag mask and value, one
+-- "any" marker per field) and a verdict (0 DROP, 1 ACCEPT, 2 REJECT), plus an
+-- `aktiv` flag and a rule number.
+--
+-- The header fields this module matches against are the decoded header from
+-- ARCHITEKTUR.md (`Kopf`): proto, quelle, ziel, qport, zport, flaggen. This
+-- module takes them as plain parameters and never reads another module's
+-- table.
+--
+-- Concurrency note: `setze_regel` / `raeume_alle` are the loader path, called
+-- once at startup before the worker threads start; `passt` /
+-- `entscheide_regeln` are the hot path. There is deliberately no lock in this
+-- file: a lock would be a contract the driver lane (`lauf.gab`) and the
+-- decision lane (`entscheidung.gab`) would have to take, and ARCHITEKTUR.md
+-- names none. The checker's footprint hints (E247) that follow from this are
+-- recorded in messung/BEFUNDE-bm2.md.
+
+module brandmauer::regeln {
+
+-- How many rules the table holds. Fixed at compile time: no allocator, no
+-- growth under load. A firewall that cannot hold a rule drops it at load
+-- time (`setze_regel` names its slot), never at packet time.
+pub const REGELZAHL : u32 = 256;
+
+-- The verdicts, after ARCHITEKTUR.md. One u32, nothing else is a verdict.
+pub const VERWIRF : u32 in 0 .. 2 = 0;
+pub const NIMM_AN : u32 in 0 .. 2 = 1;
+pub const WEISE_AB : u32 in 0 .. 2 = 2;
+
+-- The default policy: what `entscheide_regeln` answers when no rule matches.
+-- A declared constant, not a magic number. Fail closed: DROP.
+pub const STANDARD : u32 in 0 .. 2 = 0;
+
+pub type Urteil = u32 in 0 .. 2;
+pub type Treffer = u32 in 0 .. 1;
+
+pub table Regel count REGELZAHL {
+    slot {
+        aktiv : u32 in 0 .. 1,
+        proto_any : u32 in 0 .. 1,
+        proto : u32 in 0 .. 255,
+        quell_any : u32 in 0 .. 1,
+        quelle : u32,
+        qmask : u32,
+        ziel_any : u32 in 0 .. 1,
+        ziel : u32,
+        zmask : u32,
+        qport_any : u32 in 0 .. 1,
+        qport_lo : u32 in 0 .. 65535,
+        qport_hi : u32 in 0 .. 65535,
+        zport_any : u32 in 0 .. 1,
+        zport_lo : u32 in 0 .. 65535,
+        zport_hi : u32 in 0 .. 65535,
+        flaggen_any : u32 in 0 .. 1,
+        flaggen_maske : u32 in 0 .. 255,
+        flaggen_wert : u32 in 0 .. 255,
+        urteil : Urteil,
+        nummer : u32 in 0 .. 255,
+    }
+}
+
+-- Does the one rule in slot `r` match the decoded header? 1 if it matches,
+-- 0 otherwise. An inactive slot never matches. Each field whose `any` marker
+-- is set is skipped; the rest must all agree. An inverted port range
+-- (`lo > hi`) matches nothing -- fail closed, documented, not refused.
+pub impl fn passt(r : index into Regel, proto : u32 in 0 .. 255, quelle : u32, ziel : u32, qport : u32 in 0 .. 65535, zport : u32 in 0 .. 65535, flaggen : u32 in 0 .. 255) -> Treffer
+    effects { reads Regel, reads Regel.slots }
+    costs <= 71 ops
+{
+    if Regel.slots[r].aktiv == 0 {
+        return 0;
+    }
+    if Regel.slots[r].proto_any == 0 {
+        if Regel.slots[r].proto != proto {
+            return 0;
+        }
+    }
+    if Regel.slots[r].quell_any == 0 {
+        if (quelle & Regel.slots[r].qmask) != (Regel.slots[r].quelle & Regel.slots[r].qmask) {
+            return 0;
+        }
+    }
+    if Regel.slots[r].ziel_any == 0 {
+        if (ziel & Regel.slots[r].zmask) != (Regel.slots[r].ziel & Regel.slots[r].zmask) {
+            return 0;
+        }
+    }
+    if Regel.slots[r].qport_any == 0 {
+        if qport < Regel.slots[r].qport_lo {
+            return 0;
+        }
+        if qport > Regel.slots[r].qport_hi {
+            return 0;
+        }
+    }
+    if Regel.slots[r].zport_any == 0 {
+        if zport < Regel.slots[r].zport_lo {
+            return 0;
+        }
+        if zport > Regel.slots[r].zport_hi {
+            return 0;
+        }
+    }
+    if Regel.slots[r].flaggen_any == 0 {
+        if (flaggen & Regel.slots[r].flaggen_maske) != (Regel.slots[r].flaggen_wert & Regel.slots[r].flaggen_maske) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+-- First match wins, walking the table in order from slot 0. The early exit
+-- is a `return` out of the `traverse` body: the walk ends at the first
+-- matching active rule. If no rule matches, the default policy STANDARD
+-- applies.
+pub impl fn entscheide_regeln(proto : u32 in 0 .. 255, quelle : u32, ziel : u32, qport : u32 in 0 .. 65535, zport : u32 in 0 .. 65535, flaggen : u32 in 0 .. 255) -> Urteil
+    effects { reads Regel, reads Regel.slots }
+    costs <= 68096 ops
+{
+    traverse k over slots of Regel by unvisited
+        touches reads Regel, reads Regel.slots
+    {
+        if passt(k, proto, quelle, ziel, qport, zport, flaggen) == 1 {
+            return Regel.slots[k].urteil;
+        }
+    }
+    return STANDARD;
+}
+
+-- Load one rule into slot `i`. The driver calls this at startup, after
+-- `raeume_alle`, once per configured rule. A firewall with a hardcoded rule
+-- set is not usable, so the table starts empty and this is the only way in.
+pub impl fn setze_regel(i : index into Regel, aktiv : u32 in 0 .. 1, proto_any : u32 in 0 .. 1, proto : u32 in 0 .. 255, quell_any : u32 in 0 .. 1, quelle : u32, qmask : u32, ziel_any : u32 in 0 .. 1, ziel : u32, zmask : u32, qport_any : u32 in 0 .. 1, qport_lo : u32 in 0 .. 65535, qport_hi : u32 in 0 .. 65535, zport_any : u32 in 0 .. 1, zport_lo : u32 in 0 .. 65535, zport_hi : u32 in 0 .. 65535, flaggen_any : u32 in 0 .. 1, flaggen_maske : u32 in 0 .. 255, flaggen_wert : u32 in 0 .. 255, urteil : Urteil, nummer : u32 in 0 .. 255)
+    effects { reads Regel, writes Regel.slots }
+    costs <= 60 ops
+{
+    Regel.slots[i].aktiv = aktiv;
+    Regel.slots[i].proto_any = proto_any;
+    Regel.slots[i].proto = proto;
+    Regel.slots[i].quell_any = quell_any;
+    Regel.slots[i].quelle = quelle;
+    Regel.slots[i].qmask = qmask;
+    Regel.slots[i].ziel_any = ziel_any;
+    Regel.slots[i].ziel = ziel;
+    Regel.slots[i].zmask = zmask;
+    Regel.slots[i].qport_any = qport_any;
+    Regel.slots[i].qport_lo = qport_lo;
+    Regel.slots[i].qport_hi = qport_hi;
+    Regel.slots[i].zport_any = zport_any;
+    Regel.slots[i].zport_lo = zport_lo;
+    Regel.slots[i].zport_hi = zport_hi;
+    Regel.slots[i].flaggen_any = flaggen_any;
+    Regel.slots[i].flaggen_maske = flaggen_maske;
+    Regel.slots[i].flaggen_wert = flaggen_wert;
+    Regel.slots[i].urteil = urteil;
+    Regel.slots[i].nummer = nummer;
+    return;
+}
+
+-- Deactivate every slot. The driver calls this once at startup before
+-- loading the configured rules, so no slot carries a leftover verdict.
+pub impl fn raeume_alle()
+    effects { reads Regel, writes Regel.slots }
+    costs <= 1024 ops
+{
+    traverse k over slots of Regel by unvisited
+        touches reads Regel, writes Regel.slots
+    {
+        Regel.slots[k].aktiv = 0;
+        Regel.slots[k].urteil = STANDARD;
+    }
+    return;
+}
+
+}
