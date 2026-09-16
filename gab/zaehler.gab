@@ -1,0 +1,5137 @@
+-- gab/zaehler.gab -- Brandmauer lane bm4: concurrent packet counters.
+--
+-- Every worker thread counts through this module: packets seen (GESAMT),
+-- per-verdict outcomes (VERWORFEN/DROP, AKZEPTIERT/ACCEPT, ABGEWIESEN/REJECT),
+-- malformed packets (FEHLFORM), connection-table-full events (VOLL), per-rule
+-- hits (REGEL000 .. REGEL255) and their total (REGELSUMME).
+--
+-- DESIGN, and why it looks the way it does:
+-- * ATOMICS, not a lock. A counter that loses increments under load is a bug
+--   the operator sees and cannot explain, so every increment is a bounded
+--   compare-exchange loop (`exchange update`), never load/store (`+=` on a
+--   shared counter is a load-operate-store sequence and loses updates).
+-- * `relaxed`: counters are statistics, a payload-free class (SPRACHE.md). No
+--   counter carries a payload, no reader pairs with a writer, so no ordering
+--   stronger than relaxed is owed. Losslessness comes from the CAS loop.
+-- * WRAPPING at 2^32 (`+% 1` in `folge`), SNMP-style. A saturating counter
+--   hides traffic volume once full; a wrapping one stays a rate source.
+-- * The `+%` step lives in `folge(x : u32)`, never on the exchange binder or
+--   a local: the emitter refuses wrapping arithmetic whose exact ranges it
+--   cannot read off a declaration (C001, see messung/BEFUNDE-bm4.md).
+-- * The CAS loop is `bounded 64 ops`, exit `zaehler_streit` (diverges): the
+--   language forbids an unbounded CAS loop, so the bound and the exit are
+--   written at every increment (C001 without them). 64 lost races in a row
+--   needs 64 consecutive colliding winners; the abort is the mandated price
+--   of boundedness, not an expected event.
+-- * 256 scalar atomics, not one atomic array: the checker accepts an indexed
+--   atomic, the emitter refuses it (C001, see BEFUNDE). Dispatch is therefore
+--   an if/else chain; `match` has no wildcard arm (D2) and no integer arms.
+-- * `accumulates` is unusable here: it carries no `pub` (P041) while every
+--   exported function naming it in `effects` owes `pub` there (N038).
+-- * Each `exchange` binds its old value and the helpers RETURN it; callers
+--   discard it as a statement (the emitter writes `(void)f();`). Without the
+--   return the emitted binding is set-but-unused and fails cc -Werror.
+--
+-- ACCOUNTING (caller's discipline, stated here so misuse is visible):
+-- * One packet: exactly one `zaehle_urteil` call. GESAMT rises with every
+--   verdict, so GESAMT == VERWORFEN + AKZEPTIERT + ABGEWIESEN (mod 2^32).
+-- * `zaehle_fehl` / `zaehle_voll` / `zaehle_regel` never touch GESAMT.
+-- * `zaehle_regel` rises together with REGELSUMME (one extra CAS loop).
+--
+-- READING: `lies_zaehler(w)` maps 0 GESAMT, 1 VERWORFEN, 2 AKZEPTIERT,
+-- 3 ABGEWIESEN, 4 FEHLFORM, 5 VOLL, 6 REGELSUMME, 7..15 reserved (0).
+-- Per-rule values come from `lies_regel_treffer(r)`: 16 addresses cannot
+-- name 256 rules.
+
+module brandmauer::zaehler {
+
+-- The seven scalar counters.
+pub atomic GESAMT : u32 relaxed;
+pub atomic VERWORFEN : u32 relaxed;
+pub atomic AKZEPTIERT : u32 relaxed;
+pub atomic ABGEWIESEN : u32 relaxed;
+pub atomic FEHLFORM : u32 relaxed;
+pub atomic VOLL : u32 relaxed;
+pub atomic REGELSUMME : u32 relaxed;
+
+-- One atomic per rule: 256 rules, 256 counters.
+pub atomic REGEL000 : u32 relaxed;
+pub atomic REGEL001 : u32 relaxed;
+pub atomic REGEL002 : u32 relaxed;
+pub atomic REGEL003 : u32 relaxed;
+pub atomic REGEL004 : u32 relaxed;
+pub atomic REGEL005 : u32 relaxed;
+pub atomic REGEL006 : u32 relaxed;
+pub atomic REGEL007 : u32 relaxed;
+pub atomic REGEL008 : u32 relaxed;
+pub atomic REGEL009 : u32 relaxed;
+pub atomic REGEL010 : u32 relaxed;
+pub atomic REGEL011 : u32 relaxed;
+pub atomic REGEL012 : u32 relaxed;
+pub atomic REGEL013 : u32 relaxed;
+pub atomic REGEL014 : u32 relaxed;
+pub atomic REGEL015 : u32 relaxed;
+pub atomic REGEL016 : u32 relaxed;
+pub atomic REGEL017 : u32 relaxed;
+pub atomic REGEL018 : u32 relaxed;
+pub atomic REGEL019 : u32 relaxed;
+pub atomic REGEL020 : u32 relaxed;
+pub atomic REGEL021 : u32 relaxed;
+pub atomic REGEL022 : u32 relaxed;
+pub atomic REGEL023 : u32 relaxed;
+pub atomic REGEL024 : u32 relaxed;
+pub atomic REGEL025 : u32 relaxed;
+pub atomic REGEL026 : u32 relaxed;
+pub atomic REGEL027 : u32 relaxed;
+pub atomic REGEL028 : u32 relaxed;
+pub atomic REGEL029 : u32 relaxed;
+pub atomic REGEL030 : u32 relaxed;
+pub atomic REGEL031 : u32 relaxed;
+pub atomic REGEL032 : u32 relaxed;
+pub atomic REGEL033 : u32 relaxed;
+pub atomic REGEL034 : u32 relaxed;
+pub atomic REGEL035 : u32 relaxed;
+pub atomic REGEL036 : u32 relaxed;
+pub atomic REGEL037 : u32 relaxed;
+pub atomic REGEL038 : u32 relaxed;
+pub atomic REGEL039 : u32 relaxed;
+pub atomic REGEL040 : u32 relaxed;
+pub atomic REGEL041 : u32 relaxed;
+pub atomic REGEL042 : u32 relaxed;
+pub atomic REGEL043 : u32 relaxed;
+pub atomic REGEL044 : u32 relaxed;
+pub atomic REGEL045 : u32 relaxed;
+pub atomic REGEL046 : u32 relaxed;
+pub atomic REGEL047 : u32 relaxed;
+pub atomic REGEL048 : u32 relaxed;
+pub atomic REGEL049 : u32 relaxed;
+pub atomic REGEL050 : u32 relaxed;
+pub atomic REGEL051 : u32 relaxed;
+pub atomic REGEL052 : u32 relaxed;
+pub atomic REGEL053 : u32 relaxed;
+pub atomic REGEL054 : u32 relaxed;
+pub atomic REGEL055 : u32 relaxed;
+pub atomic REGEL056 : u32 relaxed;
+pub atomic REGEL057 : u32 relaxed;
+pub atomic REGEL058 : u32 relaxed;
+pub atomic REGEL059 : u32 relaxed;
+pub atomic REGEL060 : u32 relaxed;
+pub atomic REGEL061 : u32 relaxed;
+pub atomic REGEL062 : u32 relaxed;
+pub atomic REGEL063 : u32 relaxed;
+pub atomic REGEL064 : u32 relaxed;
+pub atomic REGEL065 : u32 relaxed;
+pub atomic REGEL066 : u32 relaxed;
+pub atomic REGEL067 : u32 relaxed;
+pub atomic REGEL068 : u32 relaxed;
+pub atomic REGEL069 : u32 relaxed;
+pub atomic REGEL070 : u32 relaxed;
+pub atomic REGEL071 : u32 relaxed;
+pub atomic REGEL072 : u32 relaxed;
+pub atomic REGEL073 : u32 relaxed;
+pub atomic REGEL074 : u32 relaxed;
+pub atomic REGEL075 : u32 relaxed;
+pub atomic REGEL076 : u32 relaxed;
+pub atomic REGEL077 : u32 relaxed;
+pub atomic REGEL078 : u32 relaxed;
+pub atomic REGEL079 : u32 relaxed;
+pub atomic REGEL080 : u32 relaxed;
+pub atomic REGEL081 : u32 relaxed;
+pub atomic REGEL082 : u32 relaxed;
+pub atomic REGEL083 : u32 relaxed;
+pub atomic REGEL084 : u32 relaxed;
+pub atomic REGEL085 : u32 relaxed;
+pub atomic REGEL086 : u32 relaxed;
+pub atomic REGEL087 : u32 relaxed;
+pub atomic REGEL088 : u32 relaxed;
+pub atomic REGEL089 : u32 relaxed;
+pub atomic REGEL090 : u32 relaxed;
+pub atomic REGEL091 : u32 relaxed;
+pub atomic REGEL092 : u32 relaxed;
+pub atomic REGEL093 : u32 relaxed;
+pub atomic REGEL094 : u32 relaxed;
+pub atomic REGEL095 : u32 relaxed;
+pub atomic REGEL096 : u32 relaxed;
+pub atomic REGEL097 : u32 relaxed;
+pub atomic REGEL098 : u32 relaxed;
+pub atomic REGEL099 : u32 relaxed;
+pub atomic REGEL100 : u32 relaxed;
+pub atomic REGEL101 : u32 relaxed;
+pub atomic REGEL102 : u32 relaxed;
+pub atomic REGEL103 : u32 relaxed;
+pub atomic REGEL104 : u32 relaxed;
+pub atomic REGEL105 : u32 relaxed;
+pub atomic REGEL106 : u32 relaxed;
+pub atomic REGEL107 : u32 relaxed;
+pub atomic REGEL108 : u32 relaxed;
+pub atomic REGEL109 : u32 relaxed;
+pub atomic REGEL110 : u32 relaxed;
+pub atomic REGEL111 : u32 relaxed;
+pub atomic REGEL112 : u32 relaxed;
+pub atomic REGEL113 : u32 relaxed;
+pub atomic REGEL114 : u32 relaxed;
+pub atomic REGEL115 : u32 relaxed;
+pub atomic REGEL116 : u32 relaxed;
+pub atomic REGEL117 : u32 relaxed;
+pub atomic REGEL118 : u32 relaxed;
+pub atomic REGEL119 : u32 relaxed;
+pub atomic REGEL120 : u32 relaxed;
+pub atomic REGEL121 : u32 relaxed;
+pub atomic REGEL122 : u32 relaxed;
+pub atomic REGEL123 : u32 relaxed;
+pub atomic REGEL124 : u32 relaxed;
+pub atomic REGEL125 : u32 relaxed;
+pub atomic REGEL126 : u32 relaxed;
+pub atomic REGEL127 : u32 relaxed;
+pub atomic REGEL128 : u32 relaxed;
+pub atomic REGEL129 : u32 relaxed;
+pub atomic REGEL130 : u32 relaxed;
+pub atomic REGEL131 : u32 relaxed;
+pub atomic REGEL132 : u32 relaxed;
+pub atomic REGEL133 : u32 relaxed;
+pub atomic REGEL134 : u32 relaxed;
+pub atomic REGEL135 : u32 relaxed;
+pub atomic REGEL136 : u32 relaxed;
+pub atomic REGEL137 : u32 relaxed;
+pub atomic REGEL138 : u32 relaxed;
+pub atomic REGEL139 : u32 relaxed;
+pub atomic REGEL140 : u32 relaxed;
+pub atomic REGEL141 : u32 relaxed;
+pub atomic REGEL142 : u32 relaxed;
+pub atomic REGEL143 : u32 relaxed;
+pub atomic REGEL144 : u32 relaxed;
+pub atomic REGEL145 : u32 relaxed;
+pub atomic REGEL146 : u32 relaxed;
+pub atomic REGEL147 : u32 relaxed;
+pub atomic REGEL148 : u32 relaxed;
+pub atomic REGEL149 : u32 relaxed;
+pub atomic REGEL150 : u32 relaxed;
+pub atomic REGEL151 : u32 relaxed;
+pub atomic REGEL152 : u32 relaxed;
+pub atomic REGEL153 : u32 relaxed;
+pub atomic REGEL154 : u32 relaxed;
+pub atomic REGEL155 : u32 relaxed;
+pub atomic REGEL156 : u32 relaxed;
+pub atomic REGEL157 : u32 relaxed;
+pub atomic REGEL158 : u32 relaxed;
+pub atomic REGEL159 : u32 relaxed;
+pub atomic REGEL160 : u32 relaxed;
+pub atomic REGEL161 : u32 relaxed;
+pub atomic REGEL162 : u32 relaxed;
+pub atomic REGEL163 : u32 relaxed;
+pub atomic REGEL164 : u32 relaxed;
+pub atomic REGEL165 : u32 relaxed;
+pub atomic REGEL166 : u32 relaxed;
+pub atomic REGEL167 : u32 relaxed;
+pub atomic REGEL168 : u32 relaxed;
+pub atomic REGEL169 : u32 relaxed;
+pub atomic REGEL170 : u32 relaxed;
+pub atomic REGEL171 : u32 relaxed;
+pub atomic REGEL172 : u32 relaxed;
+pub atomic REGEL173 : u32 relaxed;
+pub atomic REGEL174 : u32 relaxed;
+pub atomic REGEL175 : u32 relaxed;
+pub atomic REGEL176 : u32 relaxed;
+pub atomic REGEL177 : u32 relaxed;
+pub atomic REGEL178 : u32 relaxed;
+pub atomic REGEL179 : u32 relaxed;
+pub atomic REGEL180 : u32 relaxed;
+pub atomic REGEL181 : u32 relaxed;
+pub atomic REGEL182 : u32 relaxed;
+pub atomic REGEL183 : u32 relaxed;
+pub atomic REGEL184 : u32 relaxed;
+pub atomic REGEL185 : u32 relaxed;
+pub atomic REGEL186 : u32 relaxed;
+pub atomic REGEL187 : u32 relaxed;
+pub atomic REGEL188 : u32 relaxed;
+pub atomic REGEL189 : u32 relaxed;
+pub atomic REGEL190 : u32 relaxed;
+pub atomic REGEL191 : u32 relaxed;
+pub atomic REGEL192 : u32 relaxed;
+pub atomic REGEL193 : u32 relaxed;
+pub atomic REGEL194 : u32 relaxed;
+pub atomic REGEL195 : u32 relaxed;
+pub atomic REGEL196 : u32 relaxed;
+pub atomic REGEL197 : u32 relaxed;
+pub atomic REGEL198 : u32 relaxed;
+pub atomic REGEL199 : u32 relaxed;
+pub atomic REGEL200 : u32 relaxed;
+pub atomic REGEL201 : u32 relaxed;
+pub atomic REGEL202 : u32 relaxed;
+pub atomic REGEL203 : u32 relaxed;
+pub atomic REGEL204 : u32 relaxed;
+pub atomic REGEL205 : u32 relaxed;
+pub atomic REGEL206 : u32 relaxed;
+pub atomic REGEL207 : u32 relaxed;
+pub atomic REGEL208 : u32 relaxed;
+pub atomic REGEL209 : u32 relaxed;
+pub atomic REGEL210 : u32 relaxed;
+pub atomic REGEL211 : u32 relaxed;
+pub atomic REGEL212 : u32 relaxed;
+pub atomic REGEL213 : u32 relaxed;
+pub atomic REGEL214 : u32 relaxed;
+pub atomic REGEL215 : u32 relaxed;
+pub atomic REGEL216 : u32 relaxed;
+pub atomic REGEL217 : u32 relaxed;
+pub atomic REGEL218 : u32 relaxed;
+pub atomic REGEL219 : u32 relaxed;
+pub atomic REGEL220 : u32 relaxed;
+pub atomic REGEL221 : u32 relaxed;
+pub atomic REGEL222 : u32 relaxed;
+pub atomic REGEL223 : u32 relaxed;
+pub atomic REGEL224 : u32 relaxed;
+pub atomic REGEL225 : u32 relaxed;
+pub atomic REGEL226 : u32 relaxed;
+pub atomic REGEL227 : u32 relaxed;
+pub atomic REGEL228 : u32 relaxed;
+pub atomic REGEL229 : u32 relaxed;
+pub atomic REGEL230 : u32 relaxed;
+pub atomic REGEL231 : u32 relaxed;
+pub atomic REGEL232 : u32 relaxed;
+pub atomic REGEL233 : u32 relaxed;
+pub atomic REGEL234 : u32 relaxed;
+pub atomic REGEL235 : u32 relaxed;
+pub atomic REGEL236 : u32 relaxed;
+pub atomic REGEL237 : u32 relaxed;
+pub atomic REGEL238 : u32 relaxed;
+pub atomic REGEL239 : u32 relaxed;
+pub atomic REGEL240 : u32 relaxed;
+pub atomic REGEL241 : u32 relaxed;
+pub atomic REGEL242 : u32 relaxed;
+pub atomic REGEL243 : u32 relaxed;
+pub atomic REGEL244 : u32 relaxed;
+pub atomic REGEL245 : u32 relaxed;
+pub atomic REGEL246 : u32 relaxed;
+pub atomic REGEL247 : u32 relaxed;
+pub atomic REGEL248 : u32 relaxed;
+pub atomic REGEL249 : u32 relaxed;
+pub atomic REGEL250 : u32 relaxed;
+pub atomic REGEL251 : u32 relaxed;
+pub atomic REGEL252 : u32 relaxed;
+pub atomic REGEL253 : u32 relaxed;
+pub atomic REGEL254 : u32 relaxed;
+pub atomic REGEL255 : u32 relaxed;
+
+impl fn folge(x : u32) -> u32
+    effects { pure }
+    costs <= 2 ops
+{
+    return x +% 1;
+}
+
+-- Contention exit: diverging, as the bounded loop demands.
+extern fn zaehler_streit() -> never effects { diverges };
+
+impl fn ink_gesamt() -> u32
+    effects { reads GESAMT, writes GESAMT }
+    costs <= 5 ops
+{
+    let alt_gesamt : u32 = GESAMT exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt_gesamt;
+}
+
+impl fn ink_verworfen() -> u32
+    effects { reads VERWORFEN, writes VERWORFEN }
+    costs <= 5 ops
+{
+    let alt_verworfen : u32 = VERWORFEN exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt_verworfen;
+}
+
+impl fn ink_akzeptiert() -> u32
+    effects { reads AKZEPTIERT, writes AKZEPTIERT }
+    costs <= 5 ops
+{
+    let alt_akzeptiert : u32 = AKZEPTIERT exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt_akzeptiert;
+}
+
+impl fn ink_abgewiesen() -> u32
+    effects { reads ABGEWIESEN, writes ABGEWIESEN }
+    costs <= 5 ops
+{
+    let alt_abgewiesen : u32 = ABGEWIESEN exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt_abgewiesen;
+}
+
+impl fn ink_fehlform() -> u32
+    effects { reads FEHLFORM, writes FEHLFORM }
+    costs <= 5 ops
+{
+    let alt_fehlform : u32 = FEHLFORM exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt_fehlform;
+}
+
+impl fn ink_voll() -> u32
+    effects { reads VOLL, writes VOLL }
+    costs <= 5 ops
+{
+    let alt_voll : u32 = VOLL exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt_voll;
+}
+
+impl fn ink_regelsumme() -> u32
+    effects { reads REGELSUMME, writes REGELSUMME }
+    costs <= 5 ops
+{
+    let alt_regelsumme : u32 = REGELSUMME exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt_regelsumme;
+}
+
+impl fn ink_r000() -> u32
+    effects { reads REGEL000, writes REGEL000 }
+    costs <= 5 ops
+{
+    let alt000 : u32 = REGEL000 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt000;
+}
+
+impl fn ink_r001() -> u32
+    effects { reads REGEL001, writes REGEL001 }
+    costs <= 5 ops
+{
+    let alt001 : u32 = REGEL001 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt001;
+}
+
+impl fn ink_r002() -> u32
+    effects { reads REGEL002, writes REGEL002 }
+    costs <= 5 ops
+{
+    let alt002 : u32 = REGEL002 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt002;
+}
+
+impl fn ink_r003() -> u32
+    effects { reads REGEL003, writes REGEL003 }
+    costs <= 5 ops
+{
+    let alt003 : u32 = REGEL003 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt003;
+}
+
+impl fn ink_r004() -> u32
+    effects { reads REGEL004, writes REGEL004 }
+    costs <= 5 ops
+{
+    let alt004 : u32 = REGEL004 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt004;
+}
+
+impl fn ink_r005() -> u32
+    effects { reads REGEL005, writes REGEL005 }
+    costs <= 5 ops
+{
+    let alt005 : u32 = REGEL005 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt005;
+}
+
+impl fn ink_r006() -> u32
+    effects { reads REGEL006, writes REGEL006 }
+    costs <= 5 ops
+{
+    let alt006 : u32 = REGEL006 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt006;
+}
+
+impl fn ink_r007() -> u32
+    effects { reads REGEL007, writes REGEL007 }
+    costs <= 5 ops
+{
+    let alt007 : u32 = REGEL007 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt007;
+}
+
+impl fn ink_r008() -> u32
+    effects { reads REGEL008, writes REGEL008 }
+    costs <= 5 ops
+{
+    let alt008 : u32 = REGEL008 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt008;
+}
+
+impl fn ink_r009() -> u32
+    effects { reads REGEL009, writes REGEL009 }
+    costs <= 5 ops
+{
+    let alt009 : u32 = REGEL009 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt009;
+}
+
+impl fn ink_r010() -> u32
+    effects { reads REGEL010, writes REGEL010 }
+    costs <= 5 ops
+{
+    let alt010 : u32 = REGEL010 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt010;
+}
+
+impl fn ink_r011() -> u32
+    effects { reads REGEL011, writes REGEL011 }
+    costs <= 5 ops
+{
+    let alt011 : u32 = REGEL011 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt011;
+}
+
+impl fn ink_r012() -> u32
+    effects { reads REGEL012, writes REGEL012 }
+    costs <= 5 ops
+{
+    let alt012 : u32 = REGEL012 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt012;
+}
+
+impl fn ink_r013() -> u32
+    effects { reads REGEL013, writes REGEL013 }
+    costs <= 5 ops
+{
+    let alt013 : u32 = REGEL013 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt013;
+}
+
+impl fn ink_r014() -> u32
+    effects { reads REGEL014, writes REGEL014 }
+    costs <= 5 ops
+{
+    let alt014 : u32 = REGEL014 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt014;
+}
+
+impl fn ink_r015() -> u32
+    effects { reads REGEL015, writes REGEL015 }
+    costs <= 5 ops
+{
+    let alt015 : u32 = REGEL015 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt015;
+}
+
+impl fn ink_r016() -> u32
+    effects { reads REGEL016, writes REGEL016 }
+    costs <= 5 ops
+{
+    let alt016 : u32 = REGEL016 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt016;
+}
+
+impl fn ink_r017() -> u32
+    effects { reads REGEL017, writes REGEL017 }
+    costs <= 5 ops
+{
+    let alt017 : u32 = REGEL017 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt017;
+}
+
+impl fn ink_r018() -> u32
+    effects { reads REGEL018, writes REGEL018 }
+    costs <= 5 ops
+{
+    let alt018 : u32 = REGEL018 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt018;
+}
+
+impl fn ink_r019() -> u32
+    effects { reads REGEL019, writes REGEL019 }
+    costs <= 5 ops
+{
+    let alt019 : u32 = REGEL019 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt019;
+}
+
+impl fn ink_r020() -> u32
+    effects { reads REGEL020, writes REGEL020 }
+    costs <= 5 ops
+{
+    let alt020 : u32 = REGEL020 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt020;
+}
+
+impl fn ink_r021() -> u32
+    effects { reads REGEL021, writes REGEL021 }
+    costs <= 5 ops
+{
+    let alt021 : u32 = REGEL021 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt021;
+}
+
+impl fn ink_r022() -> u32
+    effects { reads REGEL022, writes REGEL022 }
+    costs <= 5 ops
+{
+    let alt022 : u32 = REGEL022 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt022;
+}
+
+impl fn ink_r023() -> u32
+    effects { reads REGEL023, writes REGEL023 }
+    costs <= 5 ops
+{
+    let alt023 : u32 = REGEL023 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt023;
+}
+
+impl fn ink_r024() -> u32
+    effects { reads REGEL024, writes REGEL024 }
+    costs <= 5 ops
+{
+    let alt024 : u32 = REGEL024 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt024;
+}
+
+impl fn ink_r025() -> u32
+    effects { reads REGEL025, writes REGEL025 }
+    costs <= 5 ops
+{
+    let alt025 : u32 = REGEL025 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt025;
+}
+
+impl fn ink_r026() -> u32
+    effects { reads REGEL026, writes REGEL026 }
+    costs <= 5 ops
+{
+    let alt026 : u32 = REGEL026 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt026;
+}
+
+impl fn ink_r027() -> u32
+    effects { reads REGEL027, writes REGEL027 }
+    costs <= 5 ops
+{
+    let alt027 : u32 = REGEL027 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt027;
+}
+
+impl fn ink_r028() -> u32
+    effects { reads REGEL028, writes REGEL028 }
+    costs <= 5 ops
+{
+    let alt028 : u32 = REGEL028 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt028;
+}
+
+impl fn ink_r029() -> u32
+    effects { reads REGEL029, writes REGEL029 }
+    costs <= 5 ops
+{
+    let alt029 : u32 = REGEL029 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt029;
+}
+
+impl fn ink_r030() -> u32
+    effects { reads REGEL030, writes REGEL030 }
+    costs <= 5 ops
+{
+    let alt030 : u32 = REGEL030 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt030;
+}
+
+impl fn ink_r031() -> u32
+    effects { reads REGEL031, writes REGEL031 }
+    costs <= 5 ops
+{
+    let alt031 : u32 = REGEL031 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt031;
+}
+
+impl fn ink_r032() -> u32
+    effects { reads REGEL032, writes REGEL032 }
+    costs <= 5 ops
+{
+    let alt032 : u32 = REGEL032 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt032;
+}
+
+impl fn ink_r033() -> u32
+    effects { reads REGEL033, writes REGEL033 }
+    costs <= 5 ops
+{
+    let alt033 : u32 = REGEL033 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt033;
+}
+
+impl fn ink_r034() -> u32
+    effects { reads REGEL034, writes REGEL034 }
+    costs <= 5 ops
+{
+    let alt034 : u32 = REGEL034 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt034;
+}
+
+impl fn ink_r035() -> u32
+    effects { reads REGEL035, writes REGEL035 }
+    costs <= 5 ops
+{
+    let alt035 : u32 = REGEL035 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt035;
+}
+
+impl fn ink_r036() -> u32
+    effects { reads REGEL036, writes REGEL036 }
+    costs <= 5 ops
+{
+    let alt036 : u32 = REGEL036 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt036;
+}
+
+impl fn ink_r037() -> u32
+    effects { reads REGEL037, writes REGEL037 }
+    costs <= 5 ops
+{
+    let alt037 : u32 = REGEL037 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt037;
+}
+
+impl fn ink_r038() -> u32
+    effects { reads REGEL038, writes REGEL038 }
+    costs <= 5 ops
+{
+    let alt038 : u32 = REGEL038 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt038;
+}
+
+impl fn ink_r039() -> u32
+    effects { reads REGEL039, writes REGEL039 }
+    costs <= 5 ops
+{
+    let alt039 : u32 = REGEL039 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt039;
+}
+
+impl fn ink_r040() -> u32
+    effects { reads REGEL040, writes REGEL040 }
+    costs <= 5 ops
+{
+    let alt040 : u32 = REGEL040 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt040;
+}
+
+impl fn ink_r041() -> u32
+    effects { reads REGEL041, writes REGEL041 }
+    costs <= 5 ops
+{
+    let alt041 : u32 = REGEL041 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt041;
+}
+
+impl fn ink_r042() -> u32
+    effects { reads REGEL042, writes REGEL042 }
+    costs <= 5 ops
+{
+    let alt042 : u32 = REGEL042 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt042;
+}
+
+impl fn ink_r043() -> u32
+    effects { reads REGEL043, writes REGEL043 }
+    costs <= 5 ops
+{
+    let alt043 : u32 = REGEL043 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt043;
+}
+
+impl fn ink_r044() -> u32
+    effects { reads REGEL044, writes REGEL044 }
+    costs <= 5 ops
+{
+    let alt044 : u32 = REGEL044 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt044;
+}
+
+impl fn ink_r045() -> u32
+    effects { reads REGEL045, writes REGEL045 }
+    costs <= 5 ops
+{
+    let alt045 : u32 = REGEL045 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt045;
+}
+
+impl fn ink_r046() -> u32
+    effects { reads REGEL046, writes REGEL046 }
+    costs <= 5 ops
+{
+    let alt046 : u32 = REGEL046 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt046;
+}
+
+impl fn ink_r047() -> u32
+    effects { reads REGEL047, writes REGEL047 }
+    costs <= 5 ops
+{
+    let alt047 : u32 = REGEL047 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt047;
+}
+
+impl fn ink_r048() -> u32
+    effects { reads REGEL048, writes REGEL048 }
+    costs <= 5 ops
+{
+    let alt048 : u32 = REGEL048 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt048;
+}
+
+impl fn ink_r049() -> u32
+    effects { reads REGEL049, writes REGEL049 }
+    costs <= 5 ops
+{
+    let alt049 : u32 = REGEL049 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt049;
+}
+
+impl fn ink_r050() -> u32
+    effects { reads REGEL050, writes REGEL050 }
+    costs <= 5 ops
+{
+    let alt050 : u32 = REGEL050 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt050;
+}
+
+impl fn ink_r051() -> u32
+    effects { reads REGEL051, writes REGEL051 }
+    costs <= 5 ops
+{
+    let alt051 : u32 = REGEL051 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt051;
+}
+
+impl fn ink_r052() -> u32
+    effects { reads REGEL052, writes REGEL052 }
+    costs <= 5 ops
+{
+    let alt052 : u32 = REGEL052 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt052;
+}
+
+impl fn ink_r053() -> u32
+    effects { reads REGEL053, writes REGEL053 }
+    costs <= 5 ops
+{
+    let alt053 : u32 = REGEL053 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt053;
+}
+
+impl fn ink_r054() -> u32
+    effects { reads REGEL054, writes REGEL054 }
+    costs <= 5 ops
+{
+    let alt054 : u32 = REGEL054 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt054;
+}
+
+impl fn ink_r055() -> u32
+    effects { reads REGEL055, writes REGEL055 }
+    costs <= 5 ops
+{
+    let alt055 : u32 = REGEL055 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt055;
+}
+
+impl fn ink_r056() -> u32
+    effects { reads REGEL056, writes REGEL056 }
+    costs <= 5 ops
+{
+    let alt056 : u32 = REGEL056 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt056;
+}
+
+impl fn ink_r057() -> u32
+    effects { reads REGEL057, writes REGEL057 }
+    costs <= 5 ops
+{
+    let alt057 : u32 = REGEL057 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt057;
+}
+
+impl fn ink_r058() -> u32
+    effects { reads REGEL058, writes REGEL058 }
+    costs <= 5 ops
+{
+    let alt058 : u32 = REGEL058 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt058;
+}
+
+impl fn ink_r059() -> u32
+    effects { reads REGEL059, writes REGEL059 }
+    costs <= 5 ops
+{
+    let alt059 : u32 = REGEL059 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt059;
+}
+
+impl fn ink_r060() -> u32
+    effects { reads REGEL060, writes REGEL060 }
+    costs <= 5 ops
+{
+    let alt060 : u32 = REGEL060 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt060;
+}
+
+impl fn ink_r061() -> u32
+    effects { reads REGEL061, writes REGEL061 }
+    costs <= 5 ops
+{
+    let alt061 : u32 = REGEL061 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt061;
+}
+
+impl fn ink_r062() -> u32
+    effects { reads REGEL062, writes REGEL062 }
+    costs <= 5 ops
+{
+    let alt062 : u32 = REGEL062 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt062;
+}
+
+impl fn ink_r063() -> u32
+    effects { reads REGEL063, writes REGEL063 }
+    costs <= 5 ops
+{
+    let alt063 : u32 = REGEL063 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt063;
+}
+
+impl fn ink_r064() -> u32
+    effects { reads REGEL064, writes REGEL064 }
+    costs <= 5 ops
+{
+    let alt064 : u32 = REGEL064 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt064;
+}
+
+impl fn ink_r065() -> u32
+    effects { reads REGEL065, writes REGEL065 }
+    costs <= 5 ops
+{
+    let alt065 : u32 = REGEL065 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt065;
+}
+
+impl fn ink_r066() -> u32
+    effects { reads REGEL066, writes REGEL066 }
+    costs <= 5 ops
+{
+    let alt066 : u32 = REGEL066 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt066;
+}
+
+impl fn ink_r067() -> u32
+    effects { reads REGEL067, writes REGEL067 }
+    costs <= 5 ops
+{
+    let alt067 : u32 = REGEL067 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt067;
+}
+
+impl fn ink_r068() -> u32
+    effects { reads REGEL068, writes REGEL068 }
+    costs <= 5 ops
+{
+    let alt068 : u32 = REGEL068 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt068;
+}
+
+impl fn ink_r069() -> u32
+    effects { reads REGEL069, writes REGEL069 }
+    costs <= 5 ops
+{
+    let alt069 : u32 = REGEL069 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt069;
+}
+
+impl fn ink_r070() -> u32
+    effects { reads REGEL070, writes REGEL070 }
+    costs <= 5 ops
+{
+    let alt070 : u32 = REGEL070 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt070;
+}
+
+impl fn ink_r071() -> u32
+    effects { reads REGEL071, writes REGEL071 }
+    costs <= 5 ops
+{
+    let alt071 : u32 = REGEL071 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt071;
+}
+
+impl fn ink_r072() -> u32
+    effects { reads REGEL072, writes REGEL072 }
+    costs <= 5 ops
+{
+    let alt072 : u32 = REGEL072 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt072;
+}
+
+impl fn ink_r073() -> u32
+    effects { reads REGEL073, writes REGEL073 }
+    costs <= 5 ops
+{
+    let alt073 : u32 = REGEL073 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt073;
+}
+
+impl fn ink_r074() -> u32
+    effects { reads REGEL074, writes REGEL074 }
+    costs <= 5 ops
+{
+    let alt074 : u32 = REGEL074 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt074;
+}
+
+impl fn ink_r075() -> u32
+    effects { reads REGEL075, writes REGEL075 }
+    costs <= 5 ops
+{
+    let alt075 : u32 = REGEL075 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt075;
+}
+
+impl fn ink_r076() -> u32
+    effects { reads REGEL076, writes REGEL076 }
+    costs <= 5 ops
+{
+    let alt076 : u32 = REGEL076 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt076;
+}
+
+impl fn ink_r077() -> u32
+    effects { reads REGEL077, writes REGEL077 }
+    costs <= 5 ops
+{
+    let alt077 : u32 = REGEL077 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt077;
+}
+
+impl fn ink_r078() -> u32
+    effects { reads REGEL078, writes REGEL078 }
+    costs <= 5 ops
+{
+    let alt078 : u32 = REGEL078 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt078;
+}
+
+impl fn ink_r079() -> u32
+    effects { reads REGEL079, writes REGEL079 }
+    costs <= 5 ops
+{
+    let alt079 : u32 = REGEL079 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt079;
+}
+
+impl fn ink_r080() -> u32
+    effects { reads REGEL080, writes REGEL080 }
+    costs <= 5 ops
+{
+    let alt080 : u32 = REGEL080 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt080;
+}
+
+impl fn ink_r081() -> u32
+    effects { reads REGEL081, writes REGEL081 }
+    costs <= 5 ops
+{
+    let alt081 : u32 = REGEL081 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt081;
+}
+
+impl fn ink_r082() -> u32
+    effects { reads REGEL082, writes REGEL082 }
+    costs <= 5 ops
+{
+    let alt082 : u32 = REGEL082 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt082;
+}
+
+impl fn ink_r083() -> u32
+    effects { reads REGEL083, writes REGEL083 }
+    costs <= 5 ops
+{
+    let alt083 : u32 = REGEL083 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt083;
+}
+
+impl fn ink_r084() -> u32
+    effects { reads REGEL084, writes REGEL084 }
+    costs <= 5 ops
+{
+    let alt084 : u32 = REGEL084 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt084;
+}
+
+impl fn ink_r085() -> u32
+    effects { reads REGEL085, writes REGEL085 }
+    costs <= 5 ops
+{
+    let alt085 : u32 = REGEL085 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt085;
+}
+
+impl fn ink_r086() -> u32
+    effects { reads REGEL086, writes REGEL086 }
+    costs <= 5 ops
+{
+    let alt086 : u32 = REGEL086 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt086;
+}
+
+impl fn ink_r087() -> u32
+    effects { reads REGEL087, writes REGEL087 }
+    costs <= 5 ops
+{
+    let alt087 : u32 = REGEL087 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt087;
+}
+
+impl fn ink_r088() -> u32
+    effects { reads REGEL088, writes REGEL088 }
+    costs <= 5 ops
+{
+    let alt088 : u32 = REGEL088 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt088;
+}
+
+impl fn ink_r089() -> u32
+    effects { reads REGEL089, writes REGEL089 }
+    costs <= 5 ops
+{
+    let alt089 : u32 = REGEL089 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt089;
+}
+
+impl fn ink_r090() -> u32
+    effects { reads REGEL090, writes REGEL090 }
+    costs <= 5 ops
+{
+    let alt090 : u32 = REGEL090 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt090;
+}
+
+impl fn ink_r091() -> u32
+    effects { reads REGEL091, writes REGEL091 }
+    costs <= 5 ops
+{
+    let alt091 : u32 = REGEL091 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt091;
+}
+
+impl fn ink_r092() -> u32
+    effects { reads REGEL092, writes REGEL092 }
+    costs <= 5 ops
+{
+    let alt092 : u32 = REGEL092 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt092;
+}
+
+impl fn ink_r093() -> u32
+    effects { reads REGEL093, writes REGEL093 }
+    costs <= 5 ops
+{
+    let alt093 : u32 = REGEL093 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt093;
+}
+
+impl fn ink_r094() -> u32
+    effects { reads REGEL094, writes REGEL094 }
+    costs <= 5 ops
+{
+    let alt094 : u32 = REGEL094 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt094;
+}
+
+impl fn ink_r095() -> u32
+    effects { reads REGEL095, writes REGEL095 }
+    costs <= 5 ops
+{
+    let alt095 : u32 = REGEL095 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt095;
+}
+
+impl fn ink_r096() -> u32
+    effects { reads REGEL096, writes REGEL096 }
+    costs <= 5 ops
+{
+    let alt096 : u32 = REGEL096 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt096;
+}
+
+impl fn ink_r097() -> u32
+    effects { reads REGEL097, writes REGEL097 }
+    costs <= 5 ops
+{
+    let alt097 : u32 = REGEL097 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt097;
+}
+
+impl fn ink_r098() -> u32
+    effects { reads REGEL098, writes REGEL098 }
+    costs <= 5 ops
+{
+    let alt098 : u32 = REGEL098 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt098;
+}
+
+impl fn ink_r099() -> u32
+    effects { reads REGEL099, writes REGEL099 }
+    costs <= 5 ops
+{
+    let alt099 : u32 = REGEL099 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt099;
+}
+
+impl fn ink_r100() -> u32
+    effects { reads REGEL100, writes REGEL100 }
+    costs <= 5 ops
+{
+    let alt100 : u32 = REGEL100 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt100;
+}
+
+impl fn ink_r101() -> u32
+    effects { reads REGEL101, writes REGEL101 }
+    costs <= 5 ops
+{
+    let alt101 : u32 = REGEL101 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt101;
+}
+
+impl fn ink_r102() -> u32
+    effects { reads REGEL102, writes REGEL102 }
+    costs <= 5 ops
+{
+    let alt102 : u32 = REGEL102 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt102;
+}
+
+impl fn ink_r103() -> u32
+    effects { reads REGEL103, writes REGEL103 }
+    costs <= 5 ops
+{
+    let alt103 : u32 = REGEL103 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt103;
+}
+
+impl fn ink_r104() -> u32
+    effects { reads REGEL104, writes REGEL104 }
+    costs <= 5 ops
+{
+    let alt104 : u32 = REGEL104 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt104;
+}
+
+impl fn ink_r105() -> u32
+    effects { reads REGEL105, writes REGEL105 }
+    costs <= 5 ops
+{
+    let alt105 : u32 = REGEL105 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt105;
+}
+
+impl fn ink_r106() -> u32
+    effects { reads REGEL106, writes REGEL106 }
+    costs <= 5 ops
+{
+    let alt106 : u32 = REGEL106 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt106;
+}
+
+impl fn ink_r107() -> u32
+    effects { reads REGEL107, writes REGEL107 }
+    costs <= 5 ops
+{
+    let alt107 : u32 = REGEL107 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt107;
+}
+
+impl fn ink_r108() -> u32
+    effects { reads REGEL108, writes REGEL108 }
+    costs <= 5 ops
+{
+    let alt108 : u32 = REGEL108 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt108;
+}
+
+impl fn ink_r109() -> u32
+    effects { reads REGEL109, writes REGEL109 }
+    costs <= 5 ops
+{
+    let alt109 : u32 = REGEL109 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt109;
+}
+
+impl fn ink_r110() -> u32
+    effects { reads REGEL110, writes REGEL110 }
+    costs <= 5 ops
+{
+    let alt110 : u32 = REGEL110 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt110;
+}
+
+impl fn ink_r111() -> u32
+    effects { reads REGEL111, writes REGEL111 }
+    costs <= 5 ops
+{
+    let alt111 : u32 = REGEL111 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt111;
+}
+
+impl fn ink_r112() -> u32
+    effects { reads REGEL112, writes REGEL112 }
+    costs <= 5 ops
+{
+    let alt112 : u32 = REGEL112 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt112;
+}
+
+impl fn ink_r113() -> u32
+    effects { reads REGEL113, writes REGEL113 }
+    costs <= 5 ops
+{
+    let alt113 : u32 = REGEL113 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt113;
+}
+
+impl fn ink_r114() -> u32
+    effects { reads REGEL114, writes REGEL114 }
+    costs <= 5 ops
+{
+    let alt114 : u32 = REGEL114 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt114;
+}
+
+impl fn ink_r115() -> u32
+    effects { reads REGEL115, writes REGEL115 }
+    costs <= 5 ops
+{
+    let alt115 : u32 = REGEL115 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt115;
+}
+
+impl fn ink_r116() -> u32
+    effects { reads REGEL116, writes REGEL116 }
+    costs <= 5 ops
+{
+    let alt116 : u32 = REGEL116 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt116;
+}
+
+impl fn ink_r117() -> u32
+    effects { reads REGEL117, writes REGEL117 }
+    costs <= 5 ops
+{
+    let alt117 : u32 = REGEL117 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt117;
+}
+
+impl fn ink_r118() -> u32
+    effects { reads REGEL118, writes REGEL118 }
+    costs <= 5 ops
+{
+    let alt118 : u32 = REGEL118 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt118;
+}
+
+impl fn ink_r119() -> u32
+    effects { reads REGEL119, writes REGEL119 }
+    costs <= 5 ops
+{
+    let alt119 : u32 = REGEL119 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt119;
+}
+
+impl fn ink_r120() -> u32
+    effects { reads REGEL120, writes REGEL120 }
+    costs <= 5 ops
+{
+    let alt120 : u32 = REGEL120 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt120;
+}
+
+impl fn ink_r121() -> u32
+    effects { reads REGEL121, writes REGEL121 }
+    costs <= 5 ops
+{
+    let alt121 : u32 = REGEL121 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt121;
+}
+
+impl fn ink_r122() -> u32
+    effects { reads REGEL122, writes REGEL122 }
+    costs <= 5 ops
+{
+    let alt122 : u32 = REGEL122 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt122;
+}
+
+impl fn ink_r123() -> u32
+    effects { reads REGEL123, writes REGEL123 }
+    costs <= 5 ops
+{
+    let alt123 : u32 = REGEL123 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt123;
+}
+
+impl fn ink_r124() -> u32
+    effects { reads REGEL124, writes REGEL124 }
+    costs <= 5 ops
+{
+    let alt124 : u32 = REGEL124 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt124;
+}
+
+impl fn ink_r125() -> u32
+    effects { reads REGEL125, writes REGEL125 }
+    costs <= 5 ops
+{
+    let alt125 : u32 = REGEL125 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt125;
+}
+
+impl fn ink_r126() -> u32
+    effects { reads REGEL126, writes REGEL126 }
+    costs <= 5 ops
+{
+    let alt126 : u32 = REGEL126 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt126;
+}
+
+impl fn ink_r127() -> u32
+    effects { reads REGEL127, writes REGEL127 }
+    costs <= 5 ops
+{
+    let alt127 : u32 = REGEL127 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt127;
+}
+
+impl fn ink_r128() -> u32
+    effects { reads REGEL128, writes REGEL128 }
+    costs <= 5 ops
+{
+    let alt128 : u32 = REGEL128 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt128;
+}
+
+impl fn ink_r129() -> u32
+    effects { reads REGEL129, writes REGEL129 }
+    costs <= 5 ops
+{
+    let alt129 : u32 = REGEL129 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt129;
+}
+
+impl fn ink_r130() -> u32
+    effects { reads REGEL130, writes REGEL130 }
+    costs <= 5 ops
+{
+    let alt130 : u32 = REGEL130 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt130;
+}
+
+impl fn ink_r131() -> u32
+    effects { reads REGEL131, writes REGEL131 }
+    costs <= 5 ops
+{
+    let alt131 : u32 = REGEL131 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt131;
+}
+
+impl fn ink_r132() -> u32
+    effects { reads REGEL132, writes REGEL132 }
+    costs <= 5 ops
+{
+    let alt132 : u32 = REGEL132 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt132;
+}
+
+impl fn ink_r133() -> u32
+    effects { reads REGEL133, writes REGEL133 }
+    costs <= 5 ops
+{
+    let alt133 : u32 = REGEL133 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt133;
+}
+
+impl fn ink_r134() -> u32
+    effects { reads REGEL134, writes REGEL134 }
+    costs <= 5 ops
+{
+    let alt134 : u32 = REGEL134 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt134;
+}
+
+impl fn ink_r135() -> u32
+    effects { reads REGEL135, writes REGEL135 }
+    costs <= 5 ops
+{
+    let alt135 : u32 = REGEL135 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt135;
+}
+
+impl fn ink_r136() -> u32
+    effects { reads REGEL136, writes REGEL136 }
+    costs <= 5 ops
+{
+    let alt136 : u32 = REGEL136 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt136;
+}
+
+impl fn ink_r137() -> u32
+    effects { reads REGEL137, writes REGEL137 }
+    costs <= 5 ops
+{
+    let alt137 : u32 = REGEL137 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt137;
+}
+
+impl fn ink_r138() -> u32
+    effects { reads REGEL138, writes REGEL138 }
+    costs <= 5 ops
+{
+    let alt138 : u32 = REGEL138 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt138;
+}
+
+impl fn ink_r139() -> u32
+    effects { reads REGEL139, writes REGEL139 }
+    costs <= 5 ops
+{
+    let alt139 : u32 = REGEL139 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt139;
+}
+
+impl fn ink_r140() -> u32
+    effects { reads REGEL140, writes REGEL140 }
+    costs <= 5 ops
+{
+    let alt140 : u32 = REGEL140 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt140;
+}
+
+impl fn ink_r141() -> u32
+    effects { reads REGEL141, writes REGEL141 }
+    costs <= 5 ops
+{
+    let alt141 : u32 = REGEL141 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt141;
+}
+
+impl fn ink_r142() -> u32
+    effects { reads REGEL142, writes REGEL142 }
+    costs <= 5 ops
+{
+    let alt142 : u32 = REGEL142 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt142;
+}
+
+impl fn ink_r143() -> u32
+    effects { reads REGEL143, writes REGEL143 }
+    costs <= 5 ops
+{
+    let alt143 : u32 = REGEL143 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt143;
+}
+
+impl fn ink_r144() -> u32
+    effects { reads REGEL144, writes REGEL144 }
+    costs <= 5 ops
+{
+    let alt144 : u32 = REGEL144 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt144;
+}
+
+impl fn ink_r145() -> u32
+    effects { reads REGEL145, writes REGEL145 }
+    costs <= 5 ops
+{
+    let alt145 : u32 = REGEL145 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt145;
+}
+
+impl fn ink_r146() -> u32
+    effects { reads REGEL146, writes REGEL146 }
+    costs <= 5 ops
+{
+    let alt146 : u32 = REGEL146 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt146;
+}
+
+impl fn ink_r147() -> u32
+    effects { reads REGEL147, writes REGEL147 }
+    costs <= 5 ops
+{
+    let alt147 : u32 = REGEL147 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt147;
+}
+
+impl fn ink_r148() -> u32
+    effects { reads REGEL148, writes REGEL148 }
+    costs <= 5 ops
+{
+    let alt148 : u32 = REGEL148 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt148;
+}
+
+impl fn ink_r149() -> u32
+    effects { reads REGEL149, writes REGEL149 }
+    costs <= 5 ops
+{
+    let alt149 : u32 = REGEL149 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt149;
+}
+
+impl fn ink_r150() -> u32
+    effects { reads REGEL150, writes REGEL150 }
+    costs <= 5 ops
+{
+    let alt150 : u32 = REGEL150 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt150;
+}
+
+impl fn ink_r151() -> u32
+    effects { reads REGEL151, writes REGEL151 }
+    costs <= 5 ops
+{
+    let alt151 : u32 = REGEL151 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt151;
+}
+
+impl fn ink_r152() -> u32
+    effects { reads REGEL152, writes REGEL152 }
+    costs <= 5 ops
+{
+    let alt152 : u32 = REGEL152 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt152;
+}
+
+impl fn ink_r153() -> u32
+    effects { reads REGEL153, writes REGEL153 }
+    costs <= 5 ops
+{
+    let alt153 : u32 = REGEL153 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt153;
+}
+
+impl fn ink_r154() -> u32
+    effects { reads REGEL154, writes REGEL154 }
+    costs <= 5 ops
+{
+    let alt154 : u32 = REGEL154 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt154;
+}
+
+impl fn ink_r155() -> u32
+    effects { reads REGEL155, writes REGEL155 }
+    costs <= 5 ops
+{
+    let alt155 : u32 = REGEL155 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt155;
+}
+
+impl fn ink_r156() -> u32
+    effects { reads REGEL156, writes REGEL156 }
+    costs <= 5 ops
+{
+    let alt156 : u32 = REGEL156 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt156;
+}
+
+impl fn ink_r157() -> u32
+    effects { reads REGEL157, writes REGEL157 }
+    costs <= 5 ops
+{
+    let alt157 : u32 = REGEL157 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt157;
+}
+
+impl fn ink_r158() -> u32
+    effects { reads REGEL158, writes REGEL158 }
+    costs <= 5 ops
+{
+    let alt158 : u32 = REGEL158 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt158;
+}
+
+impl fn ink_r159() -> u32
+    effects { reads REGEL159, writes REGEL159 }
+    costs <= 5 ops
+{
+    let alt159 : u32 = REGEL159 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt159;
+}
+
+impl fn ink_r160() -> u32
+    effects { reads REGEL160, writes REGEL160 }
+    costs <= 5 ops
+{
+    let alt160 : u32 = REGEL160 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt160;
+}
+
+impl fn ink_r161() -> u32
+    effects { reads REGEL161, writes REGEL161 }
+    costs <= 5 ops
+{
+    let alt161 : u32 = REGEL161 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt161;
+}
+
+impl fn ink_r162() -> u32
+    effects { reads REGEL162, writes REGEL162 }
+    costs <= 5 ops
+{
+    let alt162 : u32 = REGEL162 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt162;
+}
+
+impl fn ink_r163() -> u32
+    effects { reads REGEL163, writes REGEL163 }
+    costs <= 5 ops
+{
+    let alt163 : u32 = REGEL163 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt163;
+}
+
+impl fn ink_r164() -> u32
+    effects { reads REGEL164, writes REGEL164 }
+    costs <= 5 ops
+{
+    let alt164 : u32 = REGEL164 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt164;
+}
+
+impl fn ink_r165() -> u32
+    effects { reads REGEL165, writes REGEL165 }
+    costs <= 5 ops
+{
+    let alt165 : u32 = REGEL165 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt165;
+}
+
+impl fn ink_r166() -> u32
+    effects { reads REGEL166, writes REGEL166 }
+    costs <= 5 ops
+{
+    let alt166 : u32 = REGEL166 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt166;
+}
+
+impl fn ink_r167() -> u32
+    effects { reads REGEL167, writes REGEL167 }
+    costs <= 5 ops
+{
+    let alt167 : u32 = REGEL167 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt167;
+}
+
+impl fn ink_r168() -> u32
+    effects { reads REGEL168, writes REGEL168 }
+    costs <= 5 ops
+{
+    let alt168 : u32 = REGEL168 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt168;
+}
+
+impl fn ink_r169() -> u32
+    effects { reads REGEL169, writes REGEL169 }
+    costs <= 5 ops
+{
+    let alt169 : u32 = REGEL169 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt169;
+}
+
+impl fn ink_r170() -> u32
+    effects { reads REGEL170, writes REGEL170 }
+    costs <= 5 ops
+{
+    let alt170 : u32 = REGEL170 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt170;
+}
+
+impl fn ink_r171() -> u32
+    effects { reads REGEL171, writes REGEL171 }
+    costs <= 5 ops
+{
+    let alt171 : u32 = REGEL171 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt171;
+}
+
+impl fn ink_r172() -> u32
+    effects { reads REGEL172, writes REGEL172 }
+    costs <= 5 ops
+{
+    let alt172 : u32 = REGEL172 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt172;
+}
+
+impl fn ink_r173() -> u32
+    effects { reads REGEL173, writes REGEL173 }
+    costs <= 5 ops
+{
+    let alt173 : u32 = REGEL173 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt173;
+}
+
+impl fn ink_r174() -> u32
+    effects { reads REGEL174, writes REGEL174 }
+    costs <= 5 ops
+{
+    let alt174 : u32 = REGEL174 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt174;
+}
+
+impl fn ink_r175() -> u32
+    effects { reads REGEL175, writes REGEL175 }
+    costs <= 5 ops
+{
+    let alt175 : u32 = REGEL175 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt175;
+}
+
+impl fn ink_r176() -> u32
+    effects { reads REGEL176, writes REGEL176 }
+    costs <= 5 ops
+{
+    let alt176 : u32 = REGEL176 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt176;
+}
+
+impl fn ink_r177() -> u32
+    effects { reads REGEL177, writes REGEL177 }
+    costs <= 5 ops
+{
+    let alt177 : u32 = REGEL177 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt177;
+}
+
+impl fn ink_r178() -> u32
+    effects { reads REGEL178, writes REGEL178 }
+    costs <= 5 ops
+{
+    let alt178 : u32 = REGEL178 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt178;
+}
+
+impl fn ink_r179() -> u32
+    effects { reads REGEL179, writes REGEL179 }
+    costs <= 5 ops
+{
+    let alt179 : u32 = REGEL179 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt179;
+}
+
+impl fn ink_r180() -> u32
+    effects { reads REGEL180, writes REGEL180 }
+    costs <= 5 ops
+{
+    let alt180 : u32 = REGEL180 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt180;
+}
+
+impl fn ink_r181() -> u32
+    effects { reads REGEL181, writes REGEL181 }
+    costs <= 5 ops
+{
+    let alt181 : u32 = REGEL181 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt181;
+}
+
+impl fn ink_r182() -> u32
+    effects { reads REGEL182, writes REGEL182 }
+    costs <= 5 ops
+{
+    let alt182 : u32 = REGEL182 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt182;
+}
+
+impl fn ink_r183() -> u32
+    effects { reads REGEL183, writes REGEL183 }
+    costs <= 5 ops
+{
+    let alt183 : u32 = REGEL183 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt183;
+}
+
+impl fn ink_r184() -> u32
+    effects { reads REGEL184, writes REGEL184 }
+    costs <= 5 ops
+{
+    let alt184 : u32 = REGEL184 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt184;
+}
+
+impl fn ink_r185() -> u32
+    effects { reads REGEL185, writes REGEL185 }
+    costs <= 5 ops
+{
+    let alt185 : u32 = REGEL185 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt185;
+}
+
+impl fn ink_r186() -> u32
+    effects { reads REGEL186, writes REGEL186 }
+    costs <= 5 ops
+{
+    let alt186 : u32 = REGEL186 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt186;
+}
+
+impl fn ink_r187() -> u32
+    effects { reads REGEL187, writes REGEL187 }
+    costs <= 5 ops
+{
+    let alt187 : u32 = REGEL187 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt187;
+}
+
+impl fn ink_r188() -> u32
+    effects { reads REGEL188, writes REGEL188 }
+    costs <= 5 ops
+{
+    let alt188 : u32 = REGEL188 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt188;
+}
+
+impl fn ink_r189() -> u32
+    effects { reads REGEL189, writes REGEL189 }
+    costs <= 5 ops
+{
+    let alt189 : u32 = REGEL189 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt189;
+}
+
+impl fn ink_r190() -> u32
+    effects { reads REGEL190, writes REGEL190 }
+    costs <= 5 ops
+{
+    let alt190 : u32 = REGEL190 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt190;
+}
+
+impl fn ink_r191() -> u32
+    effects { reads REGEL191, writes REGEL191 }
+    costs <= 5 ops
+{
+    let alt191 : u32 = REGEL191 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt191;
+}
+
+impl fn ink_r192() -> u32
+    effects { reads REGEL192, writes REGEL192 }
+    costs <= 5 ops
+{
+    let alt192 : u32 = REGEL192 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt192;
+}
+
+impl fn ink_r193() -> u32
+    effects { reads REGEL193, writes REGEL193 }
+    costs <= 5 ops
+{
+    let alt193 : u32 = REGEL193 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt193;
+}
+
+impl fn ink_r194() -> u32
+    effects { reads REGEL194, writes REGEL194 }
+    costs <= 5 ops
+{
+    let alt194 : u32 = REGEL194 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt194;
+}
+
+impl fn ink_r195() -> u32
+    effects { reads REGEL195, writes REGEL195 }
+    costs <= 5 ops
+{
+    let alt195 : u32 = REGEL195 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt195;
+}
+
+impl fn ink_r196() -> u32
+    effects { reads REGEL196, writes REGEL196 }
+    costs <= 5 ops
+{
+    let alt196 : u32 = REGEL196 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt196;
+}
+
+impl fn ink_r197() -> u32
+    effects { reads REGEL197, writes REGEL197 }
+    costs <= 5 ops
+{
+    let alt197 : u32 = REGEL197 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt197;
+}
+
+impl fn ink_r198() -> u32
+    effects { reads REGEL198, writes REGEL198 }
+    costs <= 5 ops
+{
+    let alt198 : u32 = REGEL198 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt198;
+}
+
+impl fn ink_r199() -> u32
+    effects { reads REGEL199, writes REGEL199 }
+    costs <= 5 ops
+{
+    let alt199 : u32 = REGEL199 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt199;
+}
+
+impl fn ink_r200() -> u32
+    effects { reads REGEL200, writes REGEL200 }
+    costs <= 5 ops
+{
+    let alt200 : u32 = REGEL200 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt200;
+}
+
+impl fn ink_r201() -> u32
+    effects { reads REGEL201, writes REGEL201 }
+    costs <= 5 ops
+{
+    let alt201 : u32 = REGEL201 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt201;
+}
+
+impl fn ink_r202() -> u32
+    effects { reads REGEL202, writes REGEL202 }
+    costs <= 5 ops
+{
+    let alt202 : u32 = REGEL202 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt202;
+}
+
+impl fn ink_r203() -> u32
+    effects { reads REGEL203, writes REGEL203 }
+    costs <= 5 ops
+{
+    let alt203 : u32 = REGEL203 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt203;
+}
+
+impl fn ink_r204() -> u32
+    effects { reads REGEL204, writes REGEL204 }
+    costs <= 5 ops
+{
+    let alt204 : u32 = REGEL204 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt204;
+}
+
+impl fn ink_r205() -> u32
+    effects { reads REGEL205, writes REGEL205 }
+    costs <= 5 ops
+{
+    let alt205 : u32 = REGEL205 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt205;
+}
+
+impl fn ink_r206() -> u32
+    effects { reads REGEL206, writes REGEL206 }
+    costs <= 5 ops
+{
+    let alt206 : u32 = REGEL206 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt206;
+}
+
+impl fn ink_r207() -> u32
+    effects { reads REGEL207, writes REGEL207 }
+    costs <= 5 ops
+{
+    let alt207 : u32 = REGEL207 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt207;
+}
+
+impl fn ink_r208() -> u32
+    effects { reads REGEL208, writes REGEL208 }
+    costs <= 5 ops
+{
+    let alt208 : u32 = REGEL208 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt208;
+}
+
+impl fn ink_r209() -> u32
+    effects { reads REGEL209, writes REGEL209 }
+    costs <= 5 ops
+{
+    let alt209 : u32 = REGEL209 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt209;
+}
+
+impl fn ink_r210() -> u32
+    effects { reads REGEL210, writes REGEL210 }
+    costs <= 5 ops
+{
+    let alt210 : u32 = REGEL210 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt210;
+}
+
+impl fn ink_r211() -> u32
+    effects { reads REGEL211, writes REGEL211 }
+    costs <= 5 ops
+{
+    let alt211 : u32 = REGEL211 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt211;
+}
+
+impl fn ink_r212() -> u32
+    effects { reads REGEL212, writes REGEL212 }
+    costs <= 5 ops
+{
+    let alt212 : u32 = REGEL212 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt212;
+}
+
+impl fn ink_r213() -> u32
+    effects { reads REGEL213, writes REGEL213 }
+    costs <= 5 ops
+{
+    let alt213 : u32 = REGEL213 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt213;
+}
+
+impl fn ink_r214() -> u32
+    effects { reads REGEL214, writes REGEL214 }
+    costs <= 5 ops
+{
+    let alt214 : u32 = REGEL214 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt214;
+}
+
+impl fn ink_r215() -> u32
+    effects { reads REGEL215, writes REGEL215 }
+    costs <= 5 ops
+{
+    let alt215 : u32 = REGEL215 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt215;
+}
+
+impl fn ink_r216() -> u32
+    effects { reads REGEL216, writes REGEL216 }
+    costs <= 5 ops
+{
+    let alt216 : u32 = REGEL216 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt216;
+}
+
+impl fn ink_r217() -> u32
+    effects { reads REGEL217, writes REGEL217 }
+    costs <= 5 ops
+{
+    let alt217 : u32 = REGEL217 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt217;
+}
+
+impl fn ink_r218() -> u32
+    effects { reads REGEL218, writes REGEL218 }
+    costs <= 5 ops
+{
+    let alt218 : u32 = REGEL218 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt218;
+}
+
+impl fn ink_r219() -> u32
+    effects { reads REGEL219, writes REGEL219 }
+    costs <= 5 ops
+{
+    let alt219 : u32 = REGEL219 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt219;
+}
+
+impl fn ink_r220() -> u32
+    effects { reads REGEL220, writes REGEL220 }
+    costs <= 5 ops
+{
+    let alt220 : u32 = REGEL220 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt220;
+}
+
+impl fn ink_r221() -> u32
+    effects { reads REGEL221, writes REGEL221 }
+    costs <= 5 ops
+{
+    let alt221 : u32 = REGEL221 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt221;
+}
+
+impl fn ink_r222() -> u32
+    effects { reads REGEL222, writes REGEL222 }
+    costs <= 5 ops
+{
+    let alt222 : u32 = REGEL222 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt222;
+}
+
+impl fn ink_r223() -> u32
+    effects { reads REGEL223, writes REGEL223 }
+    costs <= 5 ops
+{
+    let alt223 : u32 = REGEL223 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt223;
+}
+
+impl fn ink_r224() -> u32
+    effects { reads REGEL224, writes REGEL224 }
+    costs <= 5 ops
+{
+    let alt224 : u32 = REGEL224 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt224;
+}
+
+impl fn ink_r225() -> u32
+    effects { reads REGEL225, writes REGEL225 }
+    costs <= 5 ops
+{
+    let alt225 : u32 = REGEL225 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt225;
+}
+
+impl fn ink_r226() -> u32
+    effects { reads REGEL226, writes REGEL226 }
+    costs <= 5 ops
+{
+    let alt226 : u32 = REGEL226 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt226;
+}
+
+impl fn ink_r227() -> u32
+    effects { reads REGEL227, writes REGEL227 }
+    costs <= 5 ops
+{
+    let alt227 : u32 = REGEL227 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt227;
+}
+
+impl fn ink_r228() -> u32
+    effects { reads REGEL228, writes REGEL228 }
+    costs <= 5 ops
+{
+    let alt228 : u32 = REGEL228 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt228;
+}
+
+impl fn ink_r229() -> u32
+    effects { reads REGEL229, writes REGEL229 }
+    costs <= 5 ops
+{
+    let alt229 : u32 = REGEL229 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt229;
+}
+
+impl fn ink_r230() -> u32
+    effects { reads REGEL230, writes REGEL230 }
+    costs <= 5 ops
+{
+    let alt230 : u32 = REGEL230 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt230;
+}
+
+impl fn ink_r231() -> u32
+    effects { reads REGEL231, writes REGEL231 }
+    costs <= 5 ops
+{
+    let alt231 : u32 = REGEL231 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt231;
+}
+
+impl fn ink_r232() -> u32
+    effects { reads REGEL232, writes REGEL232 }
+    costs <= 5 ops
+{
+    let alt232 : u32 = REGEL232 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt232;
+}
+
+impl fn ink_r233() -> u32
+    effects { reads REGEL233, writes REGEL233 }
+    costs <= 5 ops
+{
+    let alt233 : u32 = REGEL233 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt233;
+}
+
+impl fn ink_r234() -> u32
+    effects { reads REGEL234, writes REGEL234 }
+    costs <= 5 ops
+{
+    let alt234 : u32 = REGEL234 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt234;
+}
+
+impl fn ink_r235() -> u32
+    effects { reads REGEL235, writes REGEL235 }
+    costs <= 5 ops
+{
+    let alt235 : u32 = REGEL235 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt235;
+}
+
+impl fn ink_r236() -> u32
+    effects { reads REGEL236, writes REGEL236 }
+    costs <= 5 ops
+{
+    let alt236 : u32 = REGEL236 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt236;
+}
+
+impl fn ink_r237() -> u32
+    effects { reads REGEL237, writes REGEL237 }
+    costs <= 5 ops
+{
+    let alt237 : u32 = REGEL237 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt237;
+}
+
+impl fn ink_r238() -> u32
+    effects { reads REGEL238, writes REGEL238 }
+    costs <= 5 ops
+{
+    let alt238 : u32 = REGEL238 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt238;
+}
+
+impl fn ink_r239() -> u32
+    effects { reads REGEL239, writes REGEL239 }
+    costs <= 5 ops
+{
+    let alt239 : u32 = REGEL239 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt239;
+}
+
+impl fn ink_r240() -> u32
+    effects { reads REGEL240, writes REGEL240 }
+    costs <= 5 ops
+{
+    let alt240 : u32 = REGEL240 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt240;
+}
+
+impl fn ink_r241() -> u32
+    effects { reads REGEL241, writes REGEL241 }
+    costs <= 5 ops
+{
+    let alt241 : u32 = REGEL241 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt241;
+}
+
+impl fn ink_r242() -> u32
+    effects { reads REGEL242, writes REGEL242 }
+    costs <= 5 ops
+{
+    let alt242 : u32 = REGEL242 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt242;
+}
+
+impl fn ink_r243() -> u32
+    effects { reads REGEL243, writes REGEL243 }
+    costs <= 5 ops
+{
+    let alt243 : u32 = REGEL243 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt243;
+}
+
+impl fn ink_r244() -> u32
+    effects { reads REGEL244, writes REGEL244 }
+    costs <= 5 ops
+{
+    let alt244 : u32 = REGEL244 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt244;
+}
+
+impl fn ink_r245() -> u32
+    effects { reads REGEL245, writes REGEL245 }
+    costs <= 5 ops
+{
+    let alt245 : u32 = REGEL245 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt245;
+}
+
+impl fn ink_r246() -> u32
+    effects { reads REGEL246, writes REGEL246 }
+    costs <= 5 ops
+{
+    let alt246 : u32 = REGEL246 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt246;
+}
+
+impl fn ink_r247() -> u32
+    effects { reads REGEL247, writes REGEL247 }
+    costs <= 5 ops
+{
+    let alt247 : u32 = REGEL247 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt247;
+}
+
+impl fn ink_r248() -> u32
+    effects { reads REGEL248, writes REGEL248 }
+    costs <= 5 ops
+{
+    let alt248 : u32 = REGEL248 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt248;
+}
+
+impl fn ink_r249() -> u32
+    effects { reads REGEL249, writes REGEL249 }
+    costs <= 5 ops
+{
+    let alt249 : u32 = REGEL249 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt249;
+}
+
+impl fn ink_r250() -> u32
+    effects { reads REGEL250, writes REGEL250 }
+    costs <= 5 ops
+{
+    let alt250 : u32 = REGEL250 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt250;
+}
+
+impl fn ink_r251() -> u32
+    effects { reads REGEL251, writes REGEL251 }
+    costs <= 5 ops
+{
+    let alt251 : u32 = REGEL251 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt251;
+}
+
+impl fn ink_r252() -> u32
+    effects { reads REGEL252, writes REGEL252 }
+    costs <= 5 ops
+{
+    let alt252 : u32 = REGEL252 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt252;
+}
+
+impl fn ink_r253() -> u32
+    effects { reads REGEL253, writes REGEL253 }
+    costs <= 5 ops
+{
+    let alt253 : u32 = REGEL253 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt253;
+}
+
+impl fn ink_r254() -> u32
+    effects { reads REGEL254, writes REGEL254 }
+    costs <= 5 ops
+{
+    let alt254 : u32 = REGEL254 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt254;
+}
+
+impl fn ink_r255() -> u32
+    effects { reads REGEL255, writes REGEL255 }
+    costs <= 5 ops
+{
+    let alt255 : u32 = REGEL255 exchange update(t)
+        bounded 64 ops
+        on_exceeded zaehler_streit
+    { return folge(t); } publishes nothing;
+    return alt255;
+}
+
+pub impl fn zaehle_urteil(u : u32 in 0 .. 2)
+    effects { reads VERWORFEN, writes VERWORFEN, reads AKZEPTIERT, writes AKZEPTIERT,
+              reads ABGEWIESEN, writes ABGEWIESEN, reads GESAMT, writes GESAMT }
+    costs <= 14 ops
+{
+    if u == 0 {
+        ink_verworfen();
+    } else {
+        if u == 1 {
+            ink_akzeptiert();
+        } else {
+            ink_abgewiesen();
+        }
+    }
+    ink_gesamt();
+}
+
+pub impl fn zaehle_regel(r : u32 in 0 .. 255)
+    effects { reads REGEL000, writes REGEL000, reads REGEL001, writes REGEL001, reads REGEL002, writes REGEL002, reads REGEL003, writes REGEL003, reads REGEL004, writes REGEL004, reads REGEL005, writes REGEL005, reads REGEL006, writes REGEL006, reads REGEL007, writes REGEL007, reads REGEL008, writes REGEL008, reads REGEL009, writes REGEL009, reads REGEL010, writes REGEL010, reads REGEL011, writes REGEL011, reads REGEL012, writes REGEL012, reads REGEL013, writes REGEL013, reads REGEL014, writes REGEL014, reads REGEL015, writes REGEL015, reads REGEL016, writes REGEL016, reads REGEL017, writes REGEL017, reads REGEL018, writes REGEL018, reads REGEL019, writes REGEL019, reads REGEL020, writes REGEL020, reads REGEL021, writes REGEL021, reads REGEL022, writes REGEL022, reads REGEL023, writes REGEL023, reads REGEL024, writes REGEL024, reads REGEL025, writes REGEL025, reads REGEL026, writes REGEL026, reads REGEL027, writes REGEL027, reads REGEL028, writes REGEL028, reads REGEL029, writes REGEL029, reads REGEL030, writes REGEL030, reads REGEL031, writes REGEL031, reads REGEL032, writes REGEL032, reads REGEL033, writes REGEL033, reads REGEL034, writes REGEL034, reads REGEL035, writes REGEL035, reads REGEL036, writes REGEL036, reads REGEL037, writes REGEL037, reads REGEL038, writes REGEL038, reads REGEL039, writes REGEL039, reads REGEL040, writes REGEL040, reads REGEL041, writes REGEL041, reads REGEL042, writes REGEL042, reads REGEL043, writes REGEL043, reads REGEL044, writes REGEL044, reads REGEL045, writes REGEL045, reads REGEL046, writes REGEL046, reads REGEL047, writes REGEL047, reads REGEL048, writes REGEL048, reads REGEL049, writes REGEL049, reads REGEL050, writes REGEL050, reads REGEL051, writes REGEL051, reads REGEL052, writes REGEL052, reads REGEL053, writes REGEL053, reads REGEL054, writes REGEL054, reads REGEL055, writes REGEL055, reads REGEL056, writes REGEL056, reads REGEL057, writes REGEL057, reads REGEL058, writes REGEL058, reads REGEL059, writes REGEL059, reads REGEL060, writes REGEL060, reads REGEL061, writes REGEL061, reads REGEL062, writes REGEL062, reads REGEL063, writes REGEL063, reads REGEL064, writes REGEL064, reads REGEL065, writes REGEL065, reads REGEL066, writes REGEL066, reads REGEL067, writes REGEL067, reads REGEL068, writes REGEL068, reads REGEL069, writes REGEL069, reads REGEL070, writes REGEL070, reads REGEL071, writes REGEL071, reads REGEL072, writes REGEL072, reads REGEL073, writes REGEL073, reads REGEL074, writes REGEL074, reads REGEL075, writes REGEL075, reads REGEL076, writes REGEL076, reads REGEL077, writes REGEL077, reads REGEL078, writes REGEL078, reads REGEL079, writes REGEL079, reads REGEL080, writes REGEL080, reads REGEL081, writes REGEL081, reads REGEL082, writes REGEL082, reads REGEL083, writes REGEL083, reads REGEL084, writes REGEL084, reads REGEL085, writes REGEL085, reads REGEL086, writes REGEL086, reads REGEL087, writes REGEL087, reads REGEL088, writes REGEL088, reads REGEL089, writes REGEL089, reads REGEL090, writes REGEL090, reads REGEL091, writes REGEL091, reads REGEL092, writes REGEL092, reads REGEL093, writes REGEL093, reads REGEL094, writes REGEL094, reads REGEL095, writes REGEL095, reads REGEL096, writes REGEL096, reads REGEL097, writes REGEL097, reads REGEL098, writes REGEL098, reads REGEL099, writes REGEL099, reads REGEL100, writes REGEL100, reads REGEL101, writes REGEL101, reads REGEL102, writes REGEL102, reads REGEL103, writes REGEL103, reads REGEL104, writes REGEL104, reads REGEL105, writes REGEL105, reads REGEL106, writes REGEL106, reads REGEL107, writes REGEL107, reads REGEL108, writes REGEL108, reads REGEL109, writes REGEL109, reads REGEL110, writes REGEL110, reads REGEL111, writes REGEL111, reads REGEL112, writes REGEL112, reads REGEL113, writes REGEL113, reads REGEL114, writes REGEL114, reads REGEL115, writes REGEL115, reads REGEL116, writes REGEL116, reads REGEL117, writes REGEL117, reads REGEL118, writes REGEL118, reads REGEL119, writes REGEL119, reads REGEL120, writes REGEL120, reads REGEL121, writes REGEL121, reads REGEL122, writes REGEL122, reads REGEL123, writes REGEL123, reads REGEL124, writes REGEL124, reads REGEL125, writes REGEL125, reads REGEL126, writes REGEL126, reads REGEL127, writes REGEL127, reads REGEL128, writes REGEL128, reads REGEL129, writes REGEL129, reads REGEL130, writes REGEL130, reads REGEL131, writes REGEL131, reads REGEL132, writes REGEL132, reads REGEL133, writes REGEL133, reads REGEL134, writes REGEL134, reads REGEL135, writes REGEL135, reads REGEL136, writes REGEL136, reads REGEL137, writes REGEL137, reads REGEL138, writes REGEL138, reads REGEL139, writes REGEL139, reads REGEL140, writes REGEL140, reads REGEL141, writes REGEL141, reads REGEL142, writes REGEL142, reads REGEL143, writes REGEL143, reads REGEL144, writes REGEL144, reads REGEL145, writes REGEL145, reads REGEL146, writes REGEL146, reads REGEL147, writes REGEL147, reads REGEL148, writes REGEL148, reads REGEL149, writes REGEL149, reads REGEL150, writes REGEL150, reads REGEL151, writes REGEL151, reads REGEL152, writes REGEL152, reads REGEL153, writes REGEL153, reads REGEL154, writes REGEL154, reads REGEL155, writes REGEL155, reads REGEL156, writes REGEL156, reads REGEL157, writes REGEL157, reads REGEL158, writes REGEL158, reads REGEL159, writes REGEL159, reads REGEL160, writes REGEL160, reads REGEL161, writes REGEL161, reads REGEL162, writes REGEL162, reads REGEL163, writes REGEL163, reads REGEL164, writes REGEL164, reads REGEL165, writes REGEL165, reads REGEL166, writes REGEL166, reads REGEL167, writes REGEL167, reads REGEL168, writes REGEL168, reads REGEL169, writes REGEL169, reads REGEL170, writes REGEL170, reads REGEL171, writes REGEL171, reads REGEL172, writes REGEL172, reads REGEL173, writes REGEL173, reads REGEL174, writes REGEL174, reads REGEL175, writes REGEL175, reads REGEL176, writes REGEL176, reads REGEL177, writes REGEL177, reads REGEL178, writes REGEL178, reads REGEL179, writes REGEL179, reads REGEL180, writes REGEL180, reads REGEL181, writes REGEL181, reads REGEL182, writes REGEL182, reads REGEL183, writes REGEL183, reads REGEL184, writes REGEL184, reads REGEL185, writes REGEL185, reads REGEL186, writes REGEL186, reads REGEL187, writes REGEL187, reads REGEL188, writes REGEL188, reads REGEL189, writes REGEL189, reads REGEL190, writes REGEL190, reads REGEL191, writes REGEL191, reads REGEL192, writes REGEL192, reads REGEL193, writes REGEL193, reads REGEL194, writes REGEL194, reads REGEL195, writes REGEL195, reads REGEL196, writes REGEL196, reads REGEL197, writes REGEL197, reads REGEL198, writes REGEL198, reads REGEL199, writes REGEL199, reads REGEL200, writes REGEL200, reads REGEL201, writes REGEL201, reads REGEL202, writes REGEL202, reads REGEL203, writes REGEL203, reads REGEL204, writes REGEL204, reads REGEL205, writes REGEL205, reads REGEL206, writes REGEL206, reads REGEL207, writes REGEL207, reads REGEL208, writes REGEL208, reads REGEL209, writes REGEL209, reads REGEL210, writes REGEL210, reads REGEL211, writes REGEL211, reads REGEL212, writes REGEL212, reads REGEL213, writes REGEL213, reads REGEL214, writes REGEL214, reads REGEL215, writes REGEL215, reads REGEL216, writes REGEL216, reads REGEL217, writes REGEL217, reads REGEL218, writes REGEL218, reads REGEL219, writes REGEL219, reads REGEL220, writes REGEL220, reads REGEL221, writes REGEL221, reads REGEL222, writes REGEL222, reads REGEL223, writes REGEL223, reads REGEL224, writes REGEL224, reads REGEL225, writes REGEL225, reads REGEL226, writes REGEL226, reads REGEL227, writes REGEL227, reads REGEL228, writes REGEL228, reads REGEL229, writes REGEL229, reads REGEL230, writes REGEL230, reads REGEL231, writes REGEL231, reads REGEL232, writes REGEL232, reads REGEL233, writes REGEL233, reads REGEL234, writes REGEL234, reads REGEL235, writes REGEL235, reads REGEL236, writes REGEL236, reads REGEL237, writes REGEL237, reads REGEL238, writes REGEL238, reads REGEL239, writes REGEL239, reads REGEL240, writes REGEL240, reads REGEL241, writes REGEL241, reads REGEL242, writes REGEL242, reads REGEL243, writes REGEL243, reads REGEL244, writes REGEL244, reads REGEL245, writes REGEL245, reads REGEL246, writes REGEL246, reads REGEL247, writes REGEL247, reads REGEL248, writes REGEL248, reads REGEL249, writes REGEL249, reads REGEL250, writes REGEL250, reads REGEL251, writes REGEL251, reads REGEL252, writes REGEL252, reads REGEL253, writes REGEL253, reads REGEL254, writes REGEL254, reads REGEL255, writes REGEL255, reads REGELSUMME, writes REGELSUMME }
+    costs <= 1797 ops
+{
+-- Flat: the parser refuses nesting deeper than 32 (P038), so 256 rules
+-- cannot be a nested else chain. One arm fires; the rest compare false.
+    if r == 0 {
+        ink_r000();
+    }
+    if r == 1 {
+        ink_r001();
+    }
+    if r == 2 {
+        ink_r002();
+    }
+    if r == 3 {
+        ink_r003();
+    }
+    if r == 4 {
+        ink_r004();
+    }
+    if r == 5 {
+        ink_r005();
+    }
+    if r == 6 {
+        ink_r006();
+    }
+    if r == 7 {
+        ink_r007();
+    }
+    if r == 8 {
+        ink_r008();
+    }
+    if r == 9 {
+        ink_r009();
+    }
+    if r == 10 {
+        ink_r010();
+    }
+    if r == 11 {
+        ink_r011();
+    }
+    if r == 12 {
+        ink_r012();
+    }
+    if r == 13 {
+        ink_r013();
+    }
+    if r == 14 {
+        ink_r014();
+    }
+    if r == 15 {
+        ink_r015();
+    }
+    if r == 16 {
+        ink_r016();
+    }
+    if r == 17 {
+        ink_r017();
+    }
+    if r == 18 {
+        ink_r018();
+    }
+    if r == 19 {
+        ink_r019();
+    }
+    if r == 20 {
+        ink_r020();
+    }
+    if r == 21 {
+        ink_r021();
+    }
+    if r == 22 {
+        ink_r022();
+    }
+    if r == 23 {
+        ink_r023();
+    }
+    if r == 24 {
+        ink_r024();
+    }
+    if r == 25 {
+        ink_r025();
+    }
+    if r == 26 {
+        ink_r026();
+    }
+    if r == 27 {
+        ink_r027();
+    }
+    if r == 28 {
+        ink_r028();
+    }
+    if r == 29 {
+        ink_r029();
+    }
+    if r == 30 {
+        ink_r030();
+    }
+    if r == 31 {
+        ink_r031();
+    }
+    if r == 32 {
+        ink_r032();
+    }
+    if r == 33 {
+        ink_r033();
+    }
+    if r == 34 {
+        ink_r034();
+    }
+    if r == 35 {
+        ink_r035();
+    }
+    if r == 36 {
+        ink_r036();
+    }
+    if r == 37 {
+        ink_r037();
+    }
+    if r == 38 {
+        ink_r038();
+    }
+    if r == 39 {
+        ink_r039();
+    }
+    if r == 40 {
+        ink_r040();
+    }
+    if r == 41 {
+        ink_r041();
+    }
+    if r == 42 {
+        ink_r042();
+    }
+    if r == 43 {
+        ink_r043();
+    }
+    if r == 44 {
+        ink_r044();
+    }
+    if r == 45 {
+        ink_r045();
+    }
+    if r == 46 {
+        ink_r046();
+    }
+    if r == 47 {
+        ink_r047();
+    }
+    if r == 48 {
+        ink_r048();
+    }
+    if r == 49 {
+        ink_r049();
+    }
+    if r == 50 {
+        ink_r050();
+    }
+    if r == 51 {
+        ink_r051();
+    }
+    if r == 52 {
+        ink_r052();
+    }
+    if r == 53 {
+        ink_r053();
+    }
+    if r == 54 {
+        ink_r054();
+    }
+    if r == 55 {
+        ink_r055();
+    }
+    if r == 56 {
+        ink_r056();
+    }
+    if r == 57 {
+        ink_r057();
+    }
+    if r == 58 {
+        ink_r058();
+    }
+    if r == 59 {
+        ink_r059();
+    }
+    if r == 60 {
+        ink_r060();
+    }
+    if r == 61 {
+        ink_r061();
+    }
+    if r == 62 {
+        ink_r062();
+    }
+    if r == 63 {
+        ink_r063();
+    }
+    if r == 64 {
+        ink_r064();
+    }
+    if r == 65 {
+        ink_r065();
+    }
+    if r == 66 {
+        ink_r066();
+    }
+    if r == 67 {
+        ink_r067();
+    }
+    if r == 68 {
+        ink_r068();
+    }
+    if r == 69 {
+        ink_r069();
+    }
+    if r == 70 {
+        ink_r070();
+    }
+    if r == 71 {
+        ink_r071();
+    }
+    if r == 72 {
+        ink_r072();
+    }
+    if r == 73 {
+        ink_r073();
+    }
+    if r == 74 {
+        ink_r074();
+    }
+    if r == 75 {
+        ink_r075();
+    }
+    if r == 76 {
+        ink_r076();
+    }
+    if r == 77 {
+        ink_r077();
+    }
+    if r == 78 {
+        ink_r078();
+    }
+    if r == 79 {
+        ink_r079();
+    }
+    if r == 80 {
+        ink_r080();
+    }
+    if r == 81 {
+        ink_r081();
+    }
+    if r == 82 {
+        ink_r082();
+    }
+    if r == 83 {
+        ink_r083();
+    }
+    if r == 84 {
+        ink_r084();
+    }
+    if r == 85 {
+        ink_r085();
+    }
+    if r == 86 {
+        ink_r086();
+    }
+    if r == 87 {
+        ink_r087();
+    }
+    if r == 88 {
+        ink_r088();
+    }
+    if r == 89 {
+        ink_r089();
+    }
+    if r == 90 {
+        ink_r090();
+    }
+    if r == 91 {
+        ink_r091();
+    }
+    if r == 92 {
+        ink_r092();
+    }
+    if r == 93 {
+        ink_r093();
+    }
+    if r == 94 {
+        ink_r094();
+    }
+    if r == 95 {
+        ink_r095();
+    }
+    if r == 96 {
+        ink_r096();
+    }
+    if r == 97 {
+        ink_r097();
+    }
+    if r == 98 {
+        ink_r098();
+    }
+    if r == 99 {
+        ink_r099();
+    }
+    if r == 100 {
+        ink_r100();
+    }
+    if r == 101 {
+        ink_r101();
+    }
+    if r == 102 {
+        ink_r102();
+    }
+    if r == 103 {
+        ink_r103();
+    }
+    if r == 104 {
+        ink_r104();
+    }
+    if r == 105 {
+        ink_r105();
+    }
+    if r == 106 {
+        ink_r106();
+    }
+    if r == 107 {
+        ink_r107();
+    }
+    if r == 108 {
+        ink_r108();
+    }
+    if r == 109 {
+        ink_r109();
+    }
+    if r == 110 {
+        ink_r110();
+    }
+    if r == 111 {
+        ink_r111();
+    }
+    if r == 112 {
+        ink_r112();
+    }
+    if r == 113 {
+        ink_r113();
+    }
+    if r == 114 {
+        ink_r114();
+    }
+    if r == 115 {
+        ink_r115();
+    }
+    if r == 116 {
+        ink_r116();
+    }
+    if r == 117 {
+        ink_r117();
+    }
+    if r == 118 {
+        ink_r118();
+    }
+    if r == 119 {
+        ink_r119();
+    }
+    if r == 120 {
+        ink_r120();
+    }
+    if r == 121 {
+        ink_r121();
+    }
+    if r == 122 {
+        ink_r122();
+    }
+    if r == 123 {
+        ink_r123();
+    }
+    if r == 124 {
+        ink_r124();
+    }
+    if r == 125 {
+        ink_r125();
+    }
+    if r == 126 {
+        ink_r126();
+    }
+    if r == 127 {
+        ink_r127();
+    }
+    if r == 128 {
+        ink_r128();
+    }
+    if r == 129 {
+        ink_r129();
+    }
+    if r == 130 {
+        ink_r130();
+    }
+    if r == 131 {
+        ink_r131();
+    }
+    if r == 132 {
+        ink_r132();
+    }
+    if r == 133 {
+        ink_r133();
+    }
+    if r == 134 {
+        ink_r134();
+    }
+    if r == 135 {
+        ink_r135();
+    }
+    if r == 136 {
+        ink_r136();
+    }
+    if r == 137 {
+        ink_r137();
+    }
+    if r == 138 {
+        ink_r138();
+    }
+    if r == 139 {
+        ink_r139();
+    }
+    if r == 140 {
+        ink_r140();
+    }
+    if r == 141 {
+        ink_r141();
+    }
+    if r == 142 {
+        ink_r142();
+    }
+    if r == 143 {
+        ink_r143();
+    }
+    if r == 144 {
+        ink_r144();
+    }
+    if r == 145 {
+        ink_r145();
+    }
+    if r == 146 {
+        ink_r146();
+    }
+    if r == 147 {
+        ink_r147();
+    }
+    if r == 148 {
+        ink_r148();
+    }
+    if r == 149 {
+        ink_r149();
+    }
+    if r == 150 {
+        ink_r150();
+    }
+    if r == 151 {
+        ink_r151();
+    }
+    if r == 152 {
+        ink_r152();
+    }
+    if r == 153 {
+        ink_r153();
+    }
+    if r == 154 {
+        ink_r154();
+    }
+    if r == 155 {
+        ink_r155();
+    }
+    if r == 156 {
+        ink_r156();
+    }
+    if r == 157 {
+        ink_r157();
+    }
+    if r == 158 {
+        ink_r158();
+    }
+    if r == 159 {
+        ink_r159();
+    }
+    if r == 160 {
+        ink_r160();
+    }
+    if r == 161 {
+        ink_r161();
+    }
+    if r == 162 {
+        ink_r162();
+    }
+    if r == 163 {
+        ink_r163();
+    }
+    if r == 164 {
+        ink_r164();
+    }
+    if r == 165 {
+        ink_r165();
+    }
+    if r == 166 {
+        ink_r166();
+    }
+    if r == 167 {
+        ink_r167();
+    }
+    if r == 168 {
+        ink_r168();
+    }
+    if r == 169 {
+        ink_r169();
+    }
+    if r == 170 {
+        ink_r170();
+    }
+    if r == 171 {
+        ink_r171();
+    }
+    if r == 172 {
+        ink_r172();
+    }
+    if r == 173 {
+        ink_r173();
+    }
+    if r == 174 {
+        ink_r174();
+    }
+    if r == 175 {
+        ink_r175();
+    }
+    if r == 176 {
+        ink_r176();
+    }
+    if r == 177 {
+        ink_r177();
+    }
+    if r == 178 {
+        ink_r178();
+    }
+    if r == 179 {
+        ink_r179();
+    }
+    if r == 180 {
+        ink_r180();
+    }
+    if r == 181 {
+        ink_r181();
+    }
+    if r == 182 {
+        ink_r182();
+    }
+    if r == 183 {
+        ink_r183();
+    }
+    if r == 184 {
+        ink_r184();
+    }
+    if r == 185 {
+        ink_r185();
+    }
+    if r == 186 {
+        ink_r186();
+    }
+    if r == 187 {
+        ink_r187();
+    }
+    if r == 188 {
+        ink_r188();
+    }
+    if r == 189 {
+        ink_r189();
+    }
+    if r == 190 {
+        ink_r190();
+    }
+    if r == 191 {
+        ink_r191();
+    }
+    if r == 192 {
+        ink_r192();
+    }
+    if r == 193 {
+        ink_r193();
+    }
+    if r == 194 {
+        ink_r194();
+    }
+    if r == 195 {
+        ink_r195();
+    }
+    if r == 196 {
+        ink_r196();
+    }
+    if r == 197 {
+        ink_r197();
+    }
+    if r == 198 {
+        ink_r198();
+    }
+    if r == 199 {
+        ink_r199();
+    }
+    if r == 200 {
+        ink_r200();
+    }
+    if r == 201 {
+        ink_r201();
+    }
+    if r == 202 {
+        ink_r202();
+    }
+    if r == 203 {
+        ink_r203();
+    }
+    if r == 204 {
+        ink_r204();
+    }
+    if r == 205 {
+        ink_r205();
+    }
+    if r == 206 {
+        ink_r206();
+    }
+    if r == 207 {
+        ink_r207();
+    }
+    if r == 208 {
+        ink_r208();
+    }
+    if r == 209 {
+        ink_r209();
+    }
+    if r == 210 {
+        ink_r210();
+    }
+    if r == 211 {
+        ink_r211();
+    }
+    if r == 212 {
+        ink_r212();
+    }
+    if r == 213 {
+        ink_r213();
+    }
+    if r == 214 {
+        ink_r214();
+    }
+    if r == 215 {
+        ink_r215();
+    }
+    if r == 216 {
+        ink_r216();
+    }
+    if r == 217 {
+        ink_r217();
+    }
+    if r == 218 {
+        ink_r218();
+    }
+    if r == 219 {
+        ink_r219();
+    }
+    if r == 220 {
+        ink_r220();
+    }
+    if r == 221 {
+        ink_r221();
+    }
+    if r == 222 {
+        ink_r222();
+    }
+    if r == 223 {
+        ink_r223();
+    }
+    if r == 224 {
+        ink_r224();
+    }
+    if r == 225 {
+        ink_r225();
+    }
+    if r == 226 {
+        ink_r226();
+    }
+    if r == 227 {
+        ink_r227();
+    }
+    if r == 228 {
+        ink_r228();
+    }
+    if r == 229 {
+        ink_r229();
+    }
+    if r == 230 {
+        ink_r230();
+    }
+    if r == 231 {
+        ink_r231();
+    }
+    if r == 232 {
+        ink_r232();
+    }
+    if r == 233 {
+        ink_r233();
+    }
+    if r == 234 {
+        ink_r234();
+    }
+    if r == 235 {
+        ink_r235();
+    }
+    if r == 236 {
+        ink_r236();
+    }
+    if r == 237 {
+        ink_r237();
+    }
+    if r == 238 {
+        ink_r238();
+    }
+    if r == 239 {
+        ink_r239();
+    }
+    if r == 240 {
+        ink_r240();
+    }
+    if r == 241 {
+        ink_r241();
+    }
+    if r == 242 {
+        ink_r242();
+    }
+    if r == 243 {
+        ink_r243();
+    }
+    if r == 244 {
+        ink_r244();
+    }
+    if r == 245 {
+        ink_r245();
+    }
+    if r == 246 {
+        ink_r246();
+    }
+    if r == 247 {
+        ink_r247();
+    }
+    if r == 248 {
+        ink_r248();
+    }
+    if r == 249 {
+        ink_r249();
+    }
+    if r == 250 {
+        ink_r250();
+    }
+    if r == 251 {
+        ink_r251();
+    }
+    if r == 252 {
+        ink_r252();
+    }
+    if r == 253 {
+        ink_r253();
+    }
+    if r == 254 {
+        ink_r254();
+    }
+    if r == 255 {
+        ink_r255();
+    }
+    ink_regelsumme();
+}
+
+pub impl fn zaehle_fehl()
+    effects { reads FEHLFORM, writes FEHLFORM }
+    costs <= 5 ops
+{
+    ink_fehlform();
+}
+
+pub impl fn zaehle_voll()
+    effects { reads VOLL, writes VOLL }
+    costs <= 5 ops
+{
+    ink_voll();
+}
+
+pub impl fn lies_zaehler(welcher : u32 in 0 .. 15) -> u32
+    effects { reads GESAMT, reads VERWORFEN, reads AKZEPTIERT, reads ABGEWIESEN,
+              reads FEHLFORM, reads VOLL, reads REGELSUMME }
+    costs <= 32 ops
+{
+    if welcher == 0 {
+        let n0 : u32 = GESAMT;
+        return n0;
+    } else {
+        if welcher == 1 {
+            let n1 : u32 = VERWORFEN;
+            return n1;
+        } else {
+            if welcher == 2 {
+                let n2 : u32 = AKZEPTIERT;
+                return n2;
+            } else {
+                if welcher == 3 {
+                    let n3 : u32 = ABGEWIESEN;
+                    return n3;
+                } else {
+                    if welcher == 4 {
+                        let n4 : u32 = FEHLFORM;
+                        return n4;
+                    } else {
+                        if welcher == 5 {
+                            let n5 : u32 = VOLL;
+                            return n5;
+                        } else {
+                            if welcher == 6 {
+                                let n6 : u32 = REGELSUMME;
+                                return n6;
+                            } else {
+                                if welcher == 7 {
+                                    return 0;
+                                } else {
+                                    if welcher == 8 {
+                                        return 0;
+                                    } else {
+                                        if welcher == 9 {
+                                            return 0;
+                                        } else {
+                                            if welcher == 10 {
+                                                return 0;
+                                            } else {
+                                                if welcher == 11 {
+                                                    return 0;
+                                                } else {
+                                                    if welcher == 12 {
+                                                        return 0;
+                                                    } else {
+                                                        if welcher == 13 {
+                                                            return 0;
+                                                        } else {
+                                                            if welcher == 14 {
+                                                                return 0;
+                                                            } else {
+                                                                if welcher == 15 {
+                                                                    return 0;
+                                                                } else {
+                                                                    return 0;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub impl fn lies_regel_treffer(r : u32 in 0 .. 255) -> u32
+    effects { reads REGEL000, reads REGEL001, reads REGEL002, reads REGEL003, reads REGEL004, reads REGEL005, reads REGEL006, reads REGEL007, reads REGEL008, reads REGEL009, reads REGEL010, reads REGEL011, reads REGEL012, reads REGEL013, reads REGEL014, reads REGEL015, reads REGEL016, reads REGEL017, reads REGEL018, reads REGEL019, reads REGEL020, reads REGEL021, reads REGEL022, reads REGEL023, reads REGEL024, reads REGEL025, reads REGEL026, reads REGEL027, reads REGEL028, reads REGEL029, reads REGEL030, reads REGEL031, reads REGEL032, reads REGEL033, reads REGEL034, reads REGEL035, reads REGEL036, reads REGEL037, reads REGEL038, reads REGEL039, reads REGEL040, reads REGEL041, reads REGEL042, reads REGEL043, reads REGEL044, reads REGEL045, reads REGEL046, reads REGEL047, reads REGEL048, reads REGEL049, reads REGEL050, reads REGEL051, reads REGEL052, reads REGEL053, reads REGEL054, reads REGEL055, reads REGEL056, reads REGEL057, reads REGEL058, reads REGEL059, reads REGEL060, reads REGEL061, reads REGEL062, reads REGEL063, reads REGEL064, reads REGEL065, reads REGEL066, reads REGEL067, reads REGEL068, reads REGEL069, reads REGEL070, reads REGEL071, reads REGEL072, reads REGEL073, reads REGEL074, reads REGEL075, reads REGEL076, reads REGEL077, reads REGEL078, reads REGEL079, reads REGEL080, reads REGEL081, reads REGEL082, reads REGEL083, reads REGEL084, reads REGEL085, reads REGEL086, reads REGEL087, reads REGEL088, reads REGEL089, reads REGEL090, reads REGEL091, reads REGEL092, reads REGEL093, reads REGEL094, reads REGEL095, reads REGEL096, reads REGEL097, reads REGEL098, reads REGEL099, reads REGEL100, reads REGEL101, reads REGEL102, reads REGEL103, reads REGEL104, reads REGEL105, reads REGEL106, reads REGEL107, reads REGEL108, reads REGEL109, reads REGEL110, reads REGEL111, reads REGEL112, reads REGEL113, reads REGEL114, reads REGEL115, reads REGEL116, reads REGEL117, reads REGEL118, reads REGEL119, reads REGEL120, reads REGEL121, reads REGEL122, reads REGEL123, reads REGEL124, reads REGEL125, reads REGEL126, reads REGEL127, reads REGEL128, reads REGEL129, reads REGEL130, reads REGEL131, reads REGEL132, reads REGEL133, reads REGEL134, reads REGEL135, reads REGEL136, reads REGEL137, reads REGEL138, reads REGEL139, reads REGEL140, reads REGEL141, reads REGEL142, reads REGEL143, reads REGEL144, reads REGEL145, reads REGEL146, reads REGEL147, reads REGEL148, reads REGEL149, reads REGEL150, reads REGEL151, reads REGEL152, reads REGEL153, reads REGEL154, reads REGEL155, reads REGEL156, reads REGEL157, reads REGEL158, reads REGEL159, reads REGEL160, reads REGEL161, reads REGEL162, reads REGEL163, reads REGEL164, reads REGEL165, reads REGEL166, reads REGEL167, reads REGEL168, reads REGEL169, reads REGEL170, reads REGEL171, reads REGEL172, reads REGEL173, reads REGEL174, reads REGEL175, reads REGEL176, reads REGEL177, reads REGEL178, reads REGEL179, reads REGEL180, reads REGEL181, reads REGEL182, reads REGEL183, reads REGEL184, reads REGEL185, reads REGEL186, reads REGEL187, reads REGEL188, reads REGEL189, reads REGEL190, reads REGEL191, reads REGEL192, reads REGEL193, reads REGEL194, reads REGEL195, reads REGEL196, reads REGEL197, reads REGEL198, reads REGEL199, reads REGEL200, reads REGEL201, reads REGEL202, reads REGEL203, reads REGEL204, reads REGEL205, reads REGEL206, reads REGEL207, reads REGEL208, reads REGEL209, reads REGEL210, reads REGEL211, reads REGEL212, reads REGEL213, reads REGEL214, reads REGEL215, reads REGEL216, reads REGEL217, reads REGEL218, reads REGEL219, reads REGEL220, reads REGEL221, reads REGEL222, reads REGEL223, reads REGEL224, reads REGEL225, reads REGEL226, reads REGEL227, reads REGEL228, reads REGEL229, reads REGEL230, reads REGEL231, reads REGEL232, reads REGEL233, reads REGEL234, reads REGEL235, reads REGEL236, reads REGEL237, reads REGEL238, reads REGEL239, reads REGEL240, reads REGEL241, reads REGEL242, reads REGEL243, reads REGEL244, reads REGEL245, reads REGEL246, reads REGEL247, reads REGEL248, reads REGEL249, reads REGEL250, reads REGEL251, reads REGEL252, reads REGEL253, reads REGEL254, reads REGEL255 }
+    costs <= 1538 ops
+{
+    let mut erg : u32 = 0;
+    if r == 0 {
+        let g000 : u32 = REGEL000;
+        erg = g000;
+    }
+    if r == 1 {
+        let g001 : u32 = REGEL001;
+        erg = g001;
+    }
+    if r == 2 {
+        let g002 : u32 = REGEL002;
+        erg = g002;
+    }
+    if r == 3 {
+        let g003 : u32 = REGEL003;
+        erg = g003;
+    }
+    if r == 4 {
+        let g004 : u32 = REGEL004;
+        erg = g004;
+    }
+    if r == 5 {
+        let g005 : u32 = REGEL005;
+        erg = g005;
+    }
+    if r == 6 {
+        let g006 : u32 = REGEL006;
+        erg = g006;
+    }
+    if r == 7 {
+        let g007 : u32 = REGEL007;
+        erg = g007;
+    }
+    if r == 8 {
+        let g008 : u32 = REGEL008;
+        erg = g008;
+    }
+    if r == 9 {
+        let g009 : u32 = REGEL009;
+        erg = g009;
+    }
+    if r == 10 {
+        let g010 : u32 = REGEL010;
+        erg = g010;
+    }
+    if r == 11 {
+        let g011 : u32 = REGEL011;
+        erg = g011;
+    }
+    if r == 12 {
+        let g012 : u32 = REGEL012;
+        erg = g012;
+    }
+    if r == 13 {
+        let g013 : u32 = REGEL013;
+        erg = g013;
+    }
+    if r == 14 {
+        let g014 : u32 = REGEL014;
+        erg = g014;
+    }
+    if r == 15 {
+        let g015 : u32 = REGEL015;
+        erg = g015;
+    }
+    if r == 16 {
+        let g016 : u32 = REGEL016;
+        erg = g016;
+    }
+    if r == 17 {
+        let g017 : u32 = REGEL017;
+        erg = g017;
+    }
+    if r == 18 {
+        let g018 : u32 = REGEL018;
+        erg = g018;
+    }
+    if r == 19 {
+        let g019 : u32 = REGEL019;
+        erg = g019;
+    }
+    if r == 20 {
+        let g020 : u32 = REGEL020;
+        erg = g020;
+    }
+    if r == 21 {
+        let g021 : u32 = REGEL021;
+        erg = g021;
+    }
+    if r == 22 {
+        let g022 : u32 = REGEL022;
+        erg = g022;
+    }
+    if r == 23 {
+        let g023 : u32 = REGEL023;
+        erg = g023;
+    }
+    if r == 24 {
+        let g024 : u32 = REGEL024;
+        erg = g024;
+    }
+    if r == 25 {
+        let g025 : u32 = REGEL025;
+        erg = g025;
+    }
+    if r == 26 {
+        let g026 : u32 = REGEL026;
+        erg = g026;
+    }
+    if r == 27 {
+        let g027 : u32 = REGEL027;
+        erg = g027;
+    }
+    if r == 28 {
+        let g028 : u32 = REGEL028;
+        erg = g028;
+    }
+    if r == 29 {
+        let g029 : u32 = REGEL029;
+        erg = g029;
+    }
+    if r == 30 {
+        let g030 : u32 = REGEL030;
+        erg = g030;
+    }
+    if r == 31 {
+        let g031 : u32 = REGEL031;
+        erg = g031;
+    }
+    if r == 32 {
+        let g032 : u32 = REGEL032;
+        erg = g032;
+    }
+    if r == 33 {
+        let g033 : u32 = REGEL033;
+        erg = g033;
+    }
+    if r == 34 {
+        let g034 : u32 = REGEL034;
+        erg = g034;
+    }
+    if r == 35 {
+        let g035 : u32 = REGEL035;
+        erg = g035;
+    }
+    if r == 36 {
+        let g036 : u32 = REGEL036;
+        erg = g036;
+    }
+    if r == 37 {
+        let g037 : u32 = REGEL037;
+        erg = g037;
+    }
+    if r == 38 {
+        let g038 : u32 = REGEL038;
+        erg = g038;
+    }
+    if r == 39 {
+        let g039 : u32 = REGEL039;
+        erg = g039;
+    }
+    if r == 40 {
+        let g040 : u32 = REGEL040;
+        erg = g040;
+    }
+    if r == 41 {
+        let g041 : u32 = REGEL041;
+        erg = g041;
+    }
+    if r == 42 {
+        let g042 : u32 = REGEL042;
+        erg = g042;
+    }
+    if r == 43 {
+        let g043 : u32 = REGEL043;
+        erg = g043;
+    }
+    if r == 44 {
+        let g044 : u32 = REGEL044;
+        erg = g044;
+    }
+    if r == 45 {
+        let g045 : u32 = REGEL045;
+        erg = g045;
+    }
+    if r == 46 {
+        let g046 : u32 = REGEL046;
+        erg = g046;
+    }
+    if r == 47 {
+        let g047 : u32 = REGEL047;
+        erg = g047;
+    }
+    if r == 48 {
+        let g048 : u32 = REGEL048;
+        erg = g048;
+    }
+    if r == 49 {
+        let g049 : u32 = REGEL049;
+        erg = g049;
+    }
+    if r == 50 {
+        let g050 : u32 = REGEL050;
+        erg = g050;
+    }
+    if r == 51 {
+        let g051 : u32 = REGEL051;
+        erg = g051;
+    }
+    if r == 52 {
+        let g052 : u32 = REGEL052;
+        erg = g052;
+    }
+    if r == 53 {
+        let g053 : u32 = REGEL053;
+        erg = g053;
+    }
+    if r == 54 {
+        let g054 : u32 = REGEL054;
+        erg = g054;
+    }
+    if r == 55 {
+        let g055 : u32 = REGEL055;
+        erg = g055;
+    }
+    if r == 56 {
+        let g056 : u32 = REGEL056;
+        erg = g056;
+    }
+    if r == 57 {
+        let g057 : u32 = REGEL057;
+        erg = g057;
+    }
+    if r == 58 {
+        let g058 : u32 = REGEL058;
+        erg = g058;
+    }
+    if r == 59 {
+        let g059 : u32 = REGEL059;
+        erg = g059;
+    }
+    if r == 60 {
+        let g060 : u32 = REGEL060;
+        erg = g060;
+    }
+    if r == 61 {
+        let g061 : u32 = REGEL061;
+        erg = g061;
+    }
+    if r == 62 {
+        let g062 : u32 = REGEL062;
+        erg = g062;
+    }
+    if r == 63 {
+        let g063 : u32 = REGEL063;
+        erg = g063;
+    }
+    if r == 64 {
+        let g064 : u32 = REGEL064;
+        erg = g064;
+    }
+    if r == 65 {
+        let g065 : u32 = REGEL065;
+        erg = g065;
+    }
+    if r == 66 {
+        let g066 : u32 = REGEL066;
+        erg = g066;
+    }
+    if r == 67 {
+        let g067 : u32 = REGEL067;
+        erg = g067;
+    }
+    if r == 68 {
+        let g068 : u32 = REGEL068;
+        erg = g068;
+    }
+    if r == 69 {
+        let g069 : u32 = REGEL069;
+        erg = g069;
+    }
+    if r == 70 {
+        let g070 : u32 = REGEL070;
+        erg = g070;
+    }
+    if r == 71 {
+        let g071 : u32 = REGEL071;
+        erg = g071;
+    }
+    if r == 72 {
+        let g072 : u32 = REGEL072;
+        erg = g072;
+    }
+    if r == 73 {
+        let g073 : u32 = REGEL073;
+        erg = g073;
+    }
+    if r == 74 {
+        let g074 : u32 = REGEL074;
+        erg = g074;
+    }
+    if r == 75 {
+        let g075 : u32 = REGEL075;
+        erg = g075;
+    }
+    if r == 76 {
+        let g076 : u32 = REGEL076;
+        erg = g076;
+    }
+    if r == 77 {
+        let g077 : u32 = REGEL077;
+        erg = g077;
+    }
+    if r == 78 {
+        let g078 : u32 = REGEL078;
+        erg = g078;
+    }
+    if r == 79 {
+        let g079 : u32 = REGEL079;
+        erg = g079;
+    }
+    if r == 80 {
+        let g080 : u32 = REGEL080;
+        erg = g080;
+    }
+    if r == 81 {
+        let g081 : u32 = REGEL081;
+        erg = g081;
+    }
+    if r == 82 {
+        let g082 : u32 = REGEL082;
+        erg = g082;
+    }
+    if r == 83 {
+        let g083 : u32 = REGEL083;
+        erg = g083;
+    }
+    if r == 84 {
+        let g084 : u32 = REGEL084;
+        erg = g084;
+    }
+    if r == 85 {
+        let g085 : u32 = REGEL085;
+        erg = g085;
+    }
+    if r == 86 {
+        let g086 : u32 = REGEL086;
+        erg = g086;
+    }
+    if r == 87 {
+        let g087 : u32 = REGEL087;
+        erg = g087;
+    }
+    if r == 88 {
+        let g088 : u32 = REGEL088;
+        erg = g088;
+    }
+    if r == 89 {
+        let g089 : u32 = REGEL089;
+        erg = g089;
+    }
+    if r == 90 {
+        let g090 : u32 = REGEL090;
+        erg = g090;
+    }
+    if r == 91 {
+        let g091 : u32 = REGEL091;
+        erg = g091;
+    }
+    if r == 92 {
+        let g092 : u32 = REGEL092;
+        erg = g092;
+    }
+    if r == 93 {
+        let g093 : u32 = REGEL093;
+        erg = g093;
+    }
+    if r == 94 {
+        let g094 : u32 = REGEL094;
+        erg = g094;
+    }
+    if r == 95 {
+        let g095 : u32 = REGEL095;
+        erg = g095;
+    }
+    if r == 96 {
+        let g096 : u32 = REGEL096;
+        erg = g096;
+    }
+    if r == 97 {
+        let g097 : u32 = REGEL097;
+        erg = g097;
+    }
+    if r == 98 {
+        let g098 : u32 = REGEL098;
+        erg = g098;
+    }
+    if r == 99 {
+        let g099 : u32 = REGEL099;
+        erg = g099;
+    }
+    if r == 100 {
+        let g100 : u32 = REGEL100;
+        erg = g100;
+    }
+    if r == 101 {
+        let g101 : u32 = REGEL101;
+        erg = g101;
+    }
+    if r == 102 {
+        let g102 : u32 = REGEL102;
+        erg = g102;
+    }
+    if r == 103 {
+        let g103 : u32 = REGEL103;
+        erg = g103;
+    }
+    if r == 104 {
+        let g104 : u32 = REGEL104;
+        erg = g104;
+    }
+    if r == 105 {
+        let g105 : u32 = REGEL105;
+        erg = g105;
+    }
+    if r == 106 {
+        let g106 : u32 = REGEL106;
+        erg = g106;
+    }
+    if r == 107 {
+        let g107 : u32 = REGEL107;
+        erg = g107;
+    }
+    if r == 108 {
+        let g108 : u32 = REGEL108;
+        erg = g108;
+    }
+    if r == 109 {
+        let g109 : u32 = REGEL109;
+        erg = g109;
+    }
+    if r == 110 {
+        let g110 : u32 = REGEL110;
+        erg = g110;
+    }
+    if r == 111 {
+        let g111 : u32 = REGEL111;
+        erg = g111;
+    }
+    if r == 112 {
+        let g112 : u32 = REGEL112;
+        erg = g112;
+    }
+    if r == 113 {
+        let g113 : u32 = REGEL113;
+        erg = g113;
+    }
+    if r == 114 {
+        let g114 : u32 = REGEL114;
+        erg = g114;
+    }
+    if r == 115 {
+        let g115 : u32 = REGEL115;
+        erg = g115;
+    }
+    if r == 116 {
+        let g116 : u32 = REGEL116;
+        erg = g116;
+    }
+    if r == 117 {
+        let g117 : u32 = REGEL117;
+        erg = g117;
+    }
+    if r == 118 {
+        let g118 : u32 = REGEL118;
+        erg = g118;
+    }
+    if r == 119 {
+        let g119 : u32 = REGEL119;
+        erg = g119;
+    }
+    if r == 120 {
+        let g120 : u32 = REGEL120;
+        erg = g120;
+    }
+    if r == 121 {
+        let g121 : u32 = REGEL121;
+        erg = g121;
+    }
+    if r == 122 {
+        let g122 : u32 = REGEL122;
+        erg = g122;
+    }
+    if r == 123 {
+        let g123 : u32 = REGEL123;
+        erg = g123;
+    }
+    if r == 124 {
+        let g124 : u32 = REGEL124;
+        erg = g124;
+    }
+    if r == 125 {
+        let g125 : u32 = REGEL125;
+        erg = g125;
+    }
+    if r == 126 {
+        let g126 : u32 = REGEL126;
+        erg = g126;
+    }
+    if r == 127 {
+        let g127 : u32 = REGEL127;
+        erg = g127;
+    }
+    if r == 128 {
+        let g128 : u32 = REGEL128;
+        erg = g128;
+    }
+    if r == 129 {
+        let g129 : u32 = REGEL129;
+        erg = g129;
+    }
+    if r == 130 {
+        let g130 : u32 = REGEL130;
+        erg = g130;
+    }
+    if r == 131 {
+        let g131 : u32 = REGEL131;
+        erg = g131;
+    }
+    if r == 132 {
+        let g132 : u32 = REGEL132;
+        erg = g132;
+    }
+    if r == 133 {
+        let g133 : u32 = REGEL133;
+        erg = g133;
+    }
+    if r == 134 {
+        let g134 : u32 = REGEL134;
+        erg = g134;
+    }
+    if r == 135 {
+        let g135 : u32 = REGEL135;
+        erg = g135;
+    }
+    if r == 136 {
+        let g136 : u32 = REGEL136;
+        erg = g136;
+    }
+    if r == 137 {
+        let g137 : u32 = REGEL137;
+        erg = g137;
+    }
+    if r == 138 {
+        let g138 : u32 = REGEL138;
+        erg = g138;
+    }
+    if r == 139 {
+        let g139 : u32 = REGEL139;
+        erg = g139;
+    }
+    if r == 140 {
+        let g140 : u32 = REGEL140;
+        erg = g140;
+    }
+    if r == 141 {
+        let g141 : u32 = REGEL141;
+        erg = g141;
+    }
+    if r == 142 {
+        let g142 : u32 = REGEL142;
+        erg = g142;
+    }
+    if r == 143 {
+        let g143 : u32 = REGEL143;
+        erg = g143;
+    }
+    if r == 144 {
+        let g144 : u32 = REGEL144;
+        erg = g144;
+    }
+    if r == 145 {
+        let g145 : u32 = REGEL145;
+        erg = g145;
+    }
+    if r == 146 {
+        let g146 : u32 = REGEL146;
+        erg = g146;
+    }
+    if r == 147 {
+        let g147 : u32 = REGEL147;
+        erg = g147;
+    }
+    if r == 148 {
+        let g148 : u32 = REGEL148;
+        erg = g148;
+    }
+    if r == 149 {
+        let g149 : u32 = REGEL149;
+        erg = g149;
+    }
+    if r == 150 {
+        let g150 : u32 = REGEL150;
+        erg = g150;
+    }
+    if r == 151 {
+        let g151 : u32 = REGEL151;
+        erg = g151;
+    }
+    if r == 152 {
+        let g152 : u32 = REGEL152;
+        erg = g152;
+    }
+    if r == 153 {
+        let g153 : u32 = REGEL153;
+        erg = g153;
+    }
+    if r == 154 {
+        let g154 : u32 = REGEL154;
+        erg = g154;
+    }
+    if r == 155 {
+        let g155 : u32 = REGEL155;
+        erg = g155;
+    }
+    if r == 156 {
+        let g156 : u32 = REGEL156;
+        erg = g156;
+    }
+    if r == 157 {
+        let g157 : u32 = REGEL157;
+        erg = g157;
+    }
+    if r == 158 {
+        let g158 : u32 = REGEL158;
+        erg = g158;
+    }
+    if r == 159 {
+        let g159 : u32 = REGEL159;
+        erg = g159;
+    }
+    if r == 160 {
+        let g160 : u32 = REGEL160;
+        erg = g160;
+    }
+    if r == 161 {
+        let g161 : u32 = REGEL161;
+        erg = g161;
+    }
+    if r == 162 {
+        let g162 : u32 = REGEL162;
+        erg = g162;
+    }
+    if r == 163 {
+        let g163 : u32 = REGEL163;
+        erg = g163;
+    }
+    if r == 164 {
+        let g164 : u32 = REGEL164;
+        erg = g164;
+    }
+    if r == 165 {
+        let g165 : u32 = REGEL165;
+        erg = g165;
+    }
+    if r == 166 {
+        let g166 : u32 = REGEL166;
+        erg = g166;
+    }
+    if r == 167 {
+        let g167 : u32 = REGEL167;
+        erg = g167;
+    }
+    if r == 168 {
+        let g168 : u32 = REGEL168;
+        erg = g168;
+    }
+    if r == 169 {
+        let g169 : u32 = REGEL169;
+        erg = g169;
+    }
+    if r == 170 {
+        let g170 : u32 = REGEL170;
+        erg = g170;
+    }
+    if r == 171 {
+        let g171 : u32 = REGEL171;
+        erg = g171;
+    }
+    if r == 172 {
+        let g172 : u32 = REGEL172;
+        erg = g172;
+    }
+    if r == 173 {
+        let g173 : u32 = REGEL173;
+        erg = g173;
+    }
+    if r == 174 {
+        let g174 : u32 = REGEL174;
+        erg = g174;
+    }
+    if r == 175 {
+        let g175 : u32 = REGEL175;
+        erg = g175;
+    }
+    if r == 176 {
+        let g176 : u32 = REGEL176;
+        erg = g176;
+    }
+    if r == 177 {
+        let g177 : u32 = REGEL177;
+        erg = g177;
+    }
+    if r == 178 {
+        let g178 : u32 = REGEL178;
+        erg = g178;
+    }
+    if r == 179 {
+        let g179 : u32 = REGEL179;
+        erg = g179;
+    }
+    if r == 180 {
+        let g180 : u32 = REGEL180;
+        erg = g180;
+    }
+    if r == 181 {
+        let g181 : u32 = REGEL181;
+        erg = g181;
+    }
+    if r == 182 {
+        let g182 : u32 = REGEL182;
+        erg = g182;
+    }
+    if r == 183 {
+        let g183 : u32 = REGEL183;
+        erg = g183;
+    }
+    if r == 184 {
+        let g184 : u32 = REGEL184;
+        erg = g184;
+    }
+    if r == 185 {
+        let g185 : u32 = REGEL185;
+        erg = g185;
+    }
+    if r == 186 {
+        let g186 : u32 = REGEL186;
+        erg = g186;
+    }
+    if r == 187 {
+        let g187 : u32 = REGEL187;
+        erg = g187;
+    }
+    if r == 188 {
+        let g188 : u32 = REGEL188;
+        erg = g188;
+    }
+    if r == 189 {
+        let g189 : u32 = REGEL189;
+        erg = g189;
+    }
+    if r == 190 {
+        let g190 : u32 = REGEL190;
+        erg = g190;
+    }
+    if r == 191 {
+        let g191 : u32 = REGEL191;
+        erg = g191;
+    }
+    if r == 192 {
+        let g192 : u32 = REGEL192;
+        erg = g192;
+    }
+    if r == 193 {
+        let g193 : u32 = REGEL193;
+        erg = g193;
+    }
+    if r == 194 {
+        let g194 : u32 = REGEL194;
+        erg = g194;
+    }
+    if r == 195 {
+        let g195 : u32 = REGEL195;
+        erg = g195;
+    }
+    if r == 196 {
+        let g196 : u32 = REGEL196;
+        erg = g196;
+    }
+    if r == 197 {
+        let g197 : u32 = REGEL197;
+        erg = g197;
+    }
+    if r == 198 {
+        let g198 : u32 = REGEL198;
+        erg = g198;
+    }
+    if r == 199 {
+        let g199 : u32 = REGEL199;
+        erg = g199;
+    }
+    if r == 200 {
+        let g200 : u32 = REGEL200;
+        erg = g200;
+    }
+    if r == 201 {
+        let g201 : u32 = REGEL201;
+        erg = g201;
+    }
+    if r == 202 {
+        let g202 : u32 = REGEL202;
+        erg = g202;
+    }
+    if r == 203 {
+        let g203 : u32 = REGEL203;
+        erg = g203;
+    }
+    if r == 204 {
+        let g204 : u32 = REGEL204;
+        erg = g204;
+    }
+    if r == 205 {
+        let g205 : u32 = REGEL205;
+        erg = g205;
+    }
+    if r == 206 {
+        let g206 : u32 = REGEL206;
+        erg = g206;
+    }
+    if r == 207 {
+        let g207 : u32 = REGEL207;
+        erg = g207;
+    }
+    if r == 208 {
+        let g208 : u32 = REGEL208;
+        erg = g208;
+    }
+    if r == 209 {
+        let g209 : u32 = REGEL209;
+        erg = g209;
+    }
+    if r == 210 {
+        let g210 : u32 = REGEL210;
+        erg = g210;
+    }
+    if r == 211 {
+        let g211 : u32 = REGEL211;
+        erg = g211;
+    }
+    if r == 212 {
+        let g212 : u32 = REGEL212;
+        erg = g212;
+    }
+    if r == 213 {
+        let g213 : u32 = REGEL213;
+        erg = g213;
+    }
+    if r == 214 {
+        let g214 : u32 = REGEL214;
+        erg = g214;
+    }
+    if r == 215 {
+        let g215 : u32 = REGEL215;
+        erg = g215;
+    }
+    if r == 216 {
+        let g216 : u32 = REGEL216;
+        erg = g216;
+    }
+    if r == 217 {
+        let g217 : u32 = REGEL217;
+        erg = g217;
+    }
+    if r == 218 {
+        let g218 : u32 = REGEL218;
+        erg = g218;
+    }
+    if r == 219 {
+        let g219 : u32 = REGEL219;
+        erg = g219;
+    }
+    if r == 220 {
+        let g220 : u32 = REGEL220;
+        erg = g220;
+    }
+    if r == 221 {
+        let g221 : u32 = REGEL221;
+        erg = g221;
+    }
+    if r == 222 {
+        let g222 : u32 = REGEL222;
+        erg = g222;
+    }
+    if r == 223 {
+        let g223 : u32 = REGEL223;
+        erg = g223;
+    }
+    if r == 224 {
+        let g224 : u32 = REGEL224;
+        erg = g224;
+    }
+    if r == 225 {
+        let g225 : u32 = REGEL225;
+        erg = g225;
+    }
+    if r == 226 {
+        let g226 : u32 = REGEL226;
+        erg = g226;
+    }
+    if r == 227 {
+        let g227 : u32 = REGEL227;
+        erg = g227;
+    }
+    if r == 228 {
+        let g228 : u32 = REGEL228;
+        erg = g228;
+    }
+    if r == 229 {
+        let g229 : u32 = REGEL229;
+        erg = g229;
+    }
+    if r == 230 {
+        let g230 : u32 = REGEL230;
+        erg = g230;
+    }
+    if r == 231 {
+        let g231 : u32 = REGEL231;
+        erg = g231;
+    }
+    if r == 232 {
+        let g232 : u32 = REGEL232;
+        erg = g232;
+    }
+    if r == 233 {
+        let g233 : u32 = REGEL233;
+        erg = g233;
+    }
+    if r == 234 {
+        let g234 : u32 = REGEL234;
+        erg = g234;
+    }
+    if r == 235 {
+        let g235 : u32 = REGEL235;
+        erg = g235;
+    }
+    if r == 236 {
+        let g236 : u32 = REGEL236;
+        erg = g236;
+    }
+    if r == 237 {
+        let g237 : u32 = REGEL237;
+        erg = g237;
+    }
+    if r == 238 {
+        let g238 : u32 = REGEL238;
+        erg = g238;
+    }
+    if r == 239 {
+        let g239 : u32 = REGEL239;
+        erg = g239;
+    }
+    if r == 240 {
+        let g240 : u32 = REGEL240;
+        erg = g240;
+    }
+    if r == 241 {
+        let g241 : u32 = REGEL241;
+        erg = g241;
+    }
+    if r == 242 {
+        let g242 : u32 = REGEL242;
+        erg = g242;
+    }
+    if r == 243 {
+        let g243 : u32 = REGEL243;
+        erg = g243;
+    }
+    if r == 244 {
+        let g244 : u32 = REGEL244;
+        erg = g244;
+    }
+    if r == 245 {
+        let g245 : u32 = REGEL245;
+        erg = g245;
+    }
+    if r == 246 {
+        let g246 : u32 = REGEL246;
+        erg = g246;
+    }
+    if r == 247 {
+        let g247 : u32 = REGEL247;
+        erg = g247;
+    }
+    if r == 248 {
+        let g248 : u32 = REGEL248;
+        erg = g248;
+    }
+    if r == 249 {
+        let g249 : u32 = REGEL249;
+        erg = g249;
+    }
+    if r == 250 {
+        let g250 : u32 = REGEL250;
+        erg = g250;
+    }
+    if r == 251 {
+        let g251 : u32 = REGEL251;
+        erg = g251;
+    }
+    if r == 252 {
+        let g252 : u32 = REGEL252;
+        erg = g252;
+    }
+    if r == 253 {
+        let g253 : u32 = REGEL253;
+        erg = g253;
+    }
+    if r == 254 {
+        let g254 : u32 = REGEL254;
+        erg = g254;
+    }
+    if r == 255 {
+        let g255 : u32 = REGEL255;
+        erg = g255;
+    }
+    return erg;
+}
+
+}
