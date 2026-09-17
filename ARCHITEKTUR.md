@@ -32,6 +32,13 @@ sides read it from this file.
 driver before the decision runs. 1600 covers an Ethernet MTU with headroom; a longer packet is
 truncated by the driver and decoded as far as it goes.
 
+**Lane bm12 amendment (Q-3): no Ethernet.** NFQUEUE hands the firewall layer 3:
+`Paket` starts at the IPv4 header (version/IHL at offset 0), never at an
+Ethernet header. Lanes bm1–bm11 decoded IPv4-over-Ethernet (EtherType at
+12/13) against hand-built frames; the QEMU lane measured real payloads
+starting with 0x45, and `pakete.gab` decodes bare IPv4 since. The `Kopf`
+shape above is unchanged — only where the bytes come from moved.
+
 **Connection key** — the 5-tuple in canonical direction: the smaller (address, port) pair first,
 so both directions of a flow hash to the same bucket, plus a direction bit carried beside it.
 

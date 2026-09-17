@@ -27,16 +27,17 @@
 --      sentinels live there.
 module systemrufe {
 
--- Tables this border's transports ride on (lane bm11). `use` names them
--- for the `ptr` parameter types below; the STORAGE stays with the owner
+-- Tables this border's transports ride on (lanes bm11/bm12). `use` names
+-- them for the `ptr` parameter types below; the STORAGE stays with the owner
 -- (`gab/netzverbindung.gab`) -- what crosses into this file is the type,
 -- and at run time a caller-handed pointer into the owner's memory
--- (measured: `pruefe --with bau/netz.gabi`, emit writes `struct Senden *`
+-- (measured: `pruefe --with bau/netz.gabi`, emit writes `struct PaketWort *`
 -- parameters; the unit's own virgin copies are never touched -- see the
--- wrappers). Single-file `pruefe` of this file needs `bau/netz.gabi`
--- (Makefile); without it the three names below are M119.
-use verdict::netzverbindung::Senden;
-use verdict::netzverbindung::Empfang;
+-- wrappers). Since bm12 the kernel boundary carries PACKED words, not byte
+-- slots (Q-1): `PaketWort` out, `FangWort` in. Single-file `pruefe` of this
+-- file needs `bau/netz.gabi` (Makefile); without it the names below are M119.
+use verdict::netzverbindung::PaketWort;
+use verdict::netzverbindung::FangWort;
 use verdict::netzverbindung::Adresse;
 
 -- The error channel. Shared by all ten calls so that every lane matches
@@ -649,12 +650,12 @@ pub impl fn bericht_schreiben(adresse : u64, laenge : u64) -> u64
 -- The table transports (lane bm11). The ten calls above take every address
 -- as `u64` -- a table's address has no producer for them (M127 stood here
 -- until 2026-09-16). These three take it as a `ptr` over the used tables:
--- the emitter writes `&Senden_speicher` at the call site and a
--- `struct Senden *` parameter at the stub, and the register carries the
+-- the emitter writes `&PaketWort_speicher` at the call site and a
+-- `struct PaketWort *` parameter at the stub, and the register carries the
 -- owner's memory, not a number (M140 guards the confusion). Same numbers,
 -- same register maps, same error maps, same assumes as their `u64`
 -- siblings -- only the address changes shape. The pointer is a PARAMETER:
--- the caller hands its own memory (`&Senden` in `gab/netzverbindung.gab`,
+-- the caller hands its own memory (`&PaketWort` in `gab/netzverbindung.gab`,
 -- which owns it); this file's TU-local copies of the used tables (which
 -- `emit --with` writes per translation unit) are never referenced in any
 -- body below -- virgin storage, documented, not read. File descriptors,
@@ -671,7 +672,7 @@ syscall roh_binden2(fd : u64, adresse : ptr<normal, r> Adresse, laenge : u64) ->
     costs <= 8 ops
     assume linux_netz_binden_vertrag falsifier sonde_netz_binden;
 
-syscall roh_senden2(fd : u64, nachricht : ptr<normal, r> Senden, laenge : u64, zeichen : u64, ziel : u64, ziel_laenge : u64) -> u64 or NetzFehler
+syscall roh_senden2(fd : u64, nachricht : ptr<normal, r> PaketWort, laenge : u64, zeichen : u64, ziel : u64, ziel_laenge : u64) -> u64 or NetzFehler
     abi linux arch x86_64 number 44
     regs in { rdi = fd, rsi = nachricht, rdx = laenge, r10 = zeichen, r8 = ziel, r9 = ziel_laenge }
     regs out { rax }
@@ -679,11 +680,11 @@ syscall roh_senden2(fd : u64, nachricht : ptr<normal, r> Senden, laenge : u64, z
     errors { EINTR => Unterbrochen, EAGAIN => Wiederholen, ENOBUFS => PaketeVerloren,
              EBADF => SchlechterFd, EFAULT => FehlerAdresse, EINVAL => FalscherWert,
              ENOMEM => KeinSpeicher, EACCES => KeinZugriff, EPIPE => LeitungWeg }
-    effects { reads Senden.slots }
+    effects { reads PaketWort.slots }
     costs <= 8 ops
     assume linux_netz_senden_vertrag falsifier sonde_netz_senden;
 
-syscall roh_empfangen2(fd : u64, puffer : ptr<normal, rw> Empfang, laenge : u64, zeichen : u64, quelle : u64, quell_laenge : u64) -> u64 or NetzFehler
+syscall roh_empfangen2(fd : u64, puffer : ptr<normal, rw> FangWort, laenge : u64, zeichen : u64, quelle : u64, quell_laenge : u64) -> u64 or NetzFehler
     abi linux arch x86_64 number 45
     regs in { rdi = fd, rsi = puffer, rdx = laenge, r10 = zeichen, r8 = quelle, r9 = quell_laenge }
     regs out { rax }
@@ -691,7 +692,7 @@ syscall roh_empfangen2(fd : u64, puffer : ptr<normal, rw> Empfang, laenge : u64,
     errors { EINTR => Unterbrochen, EAGAIN => Wiederholen, ENOBUFS => PaketeVerloren,
              EBADF => SchlechterFd, EFAULT => FehlerAdresse, EINVAL => FalscherWert,
              ENOMEM => KeinSpeicher }
-    effects { writes Empfang.slots }
+    effects { writes FangWort.slots }
     costs <= 8 ops
     assume linux_netz_empfangen_vertrag falsifier sonde_netz_empfangen;
 
@@ -724,8 +725,8 @@ pub impl fn netz_binden2(fd : u64, adresse : ptr<normal, r> Adresse) -> u64
     return v;
 }
 
-pub impl fn netz_senden2(fd : u64, nachricht : ptr<normal, r> Senden, laenge : u64) -> u64
-    effects { reads Senden.slots }
+pub impl fn netz_senden2(fd : u64, nachricht : ptr<normal, r> PaketWort, laenge : u64) -> u64
+    effects { reads PaketWort.slots }
     costs <= 15 ops
 {
     let v = roh_senden2(fd, nachricht, laenge, 0, 0, 0) else (e) {
@@ -750,8 +751,8 @@ pub impl fn netz_senden2(fd : u64, nachricht : ptr<normal, r> Senden, laenge : u
     return v;
 }
 
-pub impl fn netz_empfangen2(fd : u64, puffer : ptr<normal, rw> Empfang, laenge : u64) -> u64
-    effects { writes Empfang.slots }
+pub impl fn netz_empfangen2(fd : u64, puffer : ptr<normal, rw> FangWort, laenge : u64) -> u64
+    effects { writes FangWort.slots }
     costs <= 15 ops
 {
     let v = roh_empfangen2(fd, puffer, laenge, 0, 0, 0) else (e) {

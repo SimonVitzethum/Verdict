@@ -113,15 +113,17 @@ extern fn lauf_aufgegeben() -> never effects { diverges };
 extern fn netz_socket() -> u64 effects { pure };
 extern fn anhalten(status : u64) -> u64 effects { pure };
 
--- Transport mirrors (lane bm11). Each line mirrors one `pub` function of
+-- Transport mirrors (lanes bm11/bm12). Each line mirrors one `pub` function of
 -- gab/netzverbindung.gab (`einrichten`, `sende`, `empfange`) with the
 -- C-identical parameter list: file descriptors, counts and lengths travel
 -- as plain `u64` -- no table ever crosses this boundary (the pointer stays
 -- inside `gab/netzverbindung.gab`, which owns the memory). `effects
--- { pure }` is the house convention above.
-extern fn einrichten(steckdose : u64) -> u64 effects { pure } costs <= 829 ops;
-extern fn sende(steckdose : u64, laenge : u64) -> u64 effects { pure } costs <= 19 ops;
-extern fn empfange(steckdose : u64, laenge : u64) -> u64 effects { pure } costs <= 19 ops;
+-- { pure }` is the house convention above. No `costs` since bm12: the owners
+-- pack and unpack through `forever` loops, which carry no total (K003 --
+-- same class as `behandle`/`arbeite`/`main` in this file).
+extern fn einrichten(steckdose : u64) -> u64 effects { pure };
+extern fn sende(steckdose : u64, laenge : u64) -> u64 effects { pure };
+extern fn empfange(steckdose : u64, laenge : u64) -> u64 effects { pure };
 
 -- Loader mirrors. Each line mirrors one `pub` function of gab/regeln.gab with
 -- the C-identical parameter list: `index into Regel` lowers to `uint32_t`, so

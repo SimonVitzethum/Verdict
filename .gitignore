@@ -1,0 +1,9 @@
+# Build-Artefakte (Makefile baut sie neu)
+bau/
+# VM-Laufzeit: ISO, Platte, Kernel/Initrd, Logs, Share (RAM-gross, Wirt-spezifisch)
+/vm/abbilder/
+*.qcow2
+*.iso
+# Serielle Logs, Screenshots aus VM-Läufen
+*.log
+*.ppm

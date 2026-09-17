@@ -43,12 +43,18 @@
 --   u64 address is not expressible here either: the driver drains Senden
 --   through hole_senden and fills Empfang through lege_empfang, and the
 --   sendto/recvfrom calls with the resulting addresses are lauf.gab's.
+--   (Lane bm11/bm12: the transports exist after all -- `netz_binden2`,
+--   `netz_senden2`, `netz_empfangen2` over `&Adresse`/`&PaketWort`/`&FangWort`
+--   -- and since bm12 the kernel boundary carries packed words, never byte
+--   slots (Q-1): `sende` packs `Senden` into `PaketWort`, `empfange` unpacks
+--   `FangWort` into `Empfang`.)
 -- * No lock in this file: each worker owns its queue and its buffers, and
 --   ARCHITEKTUR.md names no lock for this module. The checker's footprint
 --   hints (E247) that follow are recorded in messung/BEFUNDE-bm6.md.
 --
 -- Strictness (refuse, never interpret): a short message, a foreign message
--- type, a nonzero family or version, an overrunning or short attribute, a
+-- type, a non-IPv4 family (lane bm12: the queue stamps AF_INET here, never 0)
+-- or nonzero version, an overrunning or short attribute, a
 -- short or missing packet header or a missing/empty payload all yield a named
 -- Zustand, never a guess. A payload longer than 1600 bytes is capped at 1600
 -- (ARCHITEKTUR.md: a longer packet is truncated by the driver), with the
@@ -151,6 +157,27 @@ pub table Adresse count 16 {
     }
 }
 
+-- Lane bm12 (Befund Q-1): the packed wire words. A byte-slot is a u32 cell
+-- in C (`struct { uint32_t byte; }`), so slot *i* sits at wire offset *4i* --
+-- slot-wise tables never match wire layout, and the bm11 transports proved it
+-- against a real kernel (strace: type=0, flags=0; see BERICHT-qemu.md). These
+-- two tables carry PACKED little-endian words across the kernel boundary;
+-- `Senden`/`Empfang` stay the byte-wise working representation on the Gabbro
+-- side, `packe_senden`/`lege_fang` translate between the two. `PaketWort`
+-- holds the longest send message (64 slots = 16 words), `FangWort` one full
+-- datagram (8192 slots = 2048 words).
+pub table PaketWort count 16 {
+    slot {
+        wort : u32,
+    }
+}
+
+pub table FangWort count 2048 {
+    slot {
+        wort : u32,
+    }
+}
+
 -- Little-endian host: the ..._he writes below store low-byte-first, which is
 -- host order only where the host is little-endian (x86_64). The falsifier is
 -- shape-only -- a real probe would have to reinterpret a word as bytes,
@@ -163,6 +190,20 @@ assume rechner_klein_endian
 impl fn sonde_klein_endian() -> bool
     effects { pure }
     costs   <= 4 ops
+{
+    return true;
+}
+
+-- Progress for the pack/unpack loops below (lane bm12): pass w moves word
+-- w (pack) and pass i moves byte i (unpack) -- both end at their bound.
+-- Same shape as the startup loops in gab/lauf.gab.
+assume draht_zaehlung
+    "Packen und Entpacken enden nach endlich vielen Durchgaengen: Durchgang w bewegt Wort w, Durchgang i bewegt Byte i, an der Schranke ist Schluss."
+    falsifier sonde_draht;
+
+impl fn sonde_draht() -> bool
+    effects { pure }
+    costs <= 4 ops
 {
     return true;
 }
@@ -235,6 +276,96 @@ pub impl fn hole_senden(i : index into Senden) -> Einzelbyte
     costs <= 4 ops
 {
     return Senden.slots[i].byte;
+}
+
+-- Pack `laenge` send slots into wire words (lane bm12, Q-1): word w holds
+-- slots 4w..4w+3 low-byte-first (the drehe32 pattern, without the swap --
+-- the wire IS little-endian here). Loops over words, so no division: every
+-- builder length is a multiple of 4 (28/32/28/36/32 -- stated, checked at
+-- the callers), and `w * 4 >= laenge` ends the walk exactly there. No
+-- `costs` line: the body walks a `forever` loop (K003, same class as
+-- `behandle` in gab/lauf.gab).
+pub impl fn packe_senden(laenge : u64)
+    effects { reads Senden, reads Senden.slots, reads PaketWort, writes PaketWort.slots }
+{
+    narrow laenge to 0 .. 64 else {
+        return;
+    }
+    let n : u32 in 0 .. 64 = u32(laenge);
+    let mut w : u32 in 0 .. 16 = 0;
+    forever packe
+        per_pass bounded 64 ops
+        on_exceeded netz_streit
+        effects { reads Senden, reads Senden.slots, reads PaketWort, writes PaketWort.slots }
+        progress draht_zaehlung
+    {
+        if w >= 16 {
+            leave packe;
+        }
+        if w * 4 >= n {
+            leave packe;
+        }
+        let g0 : u32 = w * 4;
+        narrow g0 to 0 .. 63 else {
+            leave packe;
+        }
+        let g1 : u32 = w * 4 + 1;
+        narrow g1 to 0 .. 63 else {
+            leave packe;
+        }
+        let g2 : u32 = w * 4 + 2;
+        narrow g2 to 0 .. 63 else {
+            leave packe;
+        }
+        let g3 : u32 = w * 4 + 3;
+        narrow g3 to 0 .. 63 else {
+            leave packe;
+        }
+        let b0 : Einzelbyte = Senden.slots[g0].byte;
+        let b1 : Einzelbyte = Senden.slots[g1].byte;
+        let b2 : Einzelbyte = Senden.slots[g2].byte;
+        let b3 : Einzelbyte = Senden.slots[g3].byte;
+        PaketWort.slots[w].wort = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216;
+        if w < 16 {
+            w += 1;
+        } else {
+            leave packe;
+        }
+    }
+    return;
+}
+
+-- Unpack `n` wire bytes out of the packed receive words into the byte-wise
+-- `Empfang` working table (lane bm12, Q-1): byte i is word `i >> 2`, lane
+-- `(i & 3) * 8`. Same loop discipline as the driver's payload copy in
+-- gab/lauf.gab (`behandle`): double guard against `n` and by `narrow`.
+-- No `costs` line (K003, see `packe_senden`).
+pub impl fn lege_fang(n : u32 in 0 .. 8192)
+    effects { reads FangWort, reads FangWort.slots, reads Empfang, writes Empfang.slots }
+{
+    let mut i : u32 = 0;
+    forever lege
+        per_pass bounded 64 ops
+        on_exceeded netz_streit
+        effects { reads FangWort, reads FangWort.slots, reads Empfang, writes Empfang.slots }
+        progress draht_zaehlung
+    {
+        if i >= n {
+            leave lege;
+        }
+        narrow i to 0 .. 8191 else {
+            leave lege;
+        }
+        let w : u32 = i >> 2;
+        narrow w to 0 .. 2047 else {
+            leave lege;
+        }
+        let s : u32 = (i & 3) * 8;
+        let wort : u32 = FangWort.slots[w].wort;
+        Empfang.slots[i].byte = (wort >> s) & 255;
+        i += 1;
+    }
+    return;
 }
 
 -- One payload byte with both bound checks: against the recorded payload
@@ -571,7 +702,11 @@ pub impl fn suche_paket(meldung : u32 in 0 .. 8192) -> Zustand
         return ergebnis_leer(2, typ);
     }
     let familie : Einzelbyte = Empfang.slots[16].byte;
-    if familie != 0 {
+    -- Lane bm12 (Befund Q-2): the queue stamps the packet's protocol family
+    -- here -- AF_INET (2) for IPv4, never 0 on a real wire (the bm6 harness
+    -- fed family 0 by hand, which is why this stood so long). Only IPv4
+    -- passes: the decoder in gab/pakete.gab reads IPv4, nothing else.
+    if familie != 2 {
         return ergebnis_leer(2, typ);
     }
     let ausgabe : Einzelbyte = Empfang.slots[17].byte;
@@ -623,7 +758,11 @@ pub impl fn suche_paket(meldung : u32 in 0 .. 8192) -> Zustand
             leave attr;
         }
         if atyp == 1 {
-            if alen < 12 {
+            -- Lane bm12 (Befund Q-4): the header is 11 bytes on a real wire
+            -- (id[4] + hw_protocol[2] + hook[1] + nlattr header[4]) -- the
+            -- kernel counts the TRUE length, padding is implicit. The bm6
+            -- harness fed 12 (pad counted) and the `12` stood so long.
+            if alen < 11 {
                 fehler = 4;
                 leave attr;
             }
@@ -683,19 +822,22 @@ pub impl fn suche_paket(meldung : u32 in 0 .. 8192) -> Zustand
     return 0;
 }
 
--- Border mirrors (lane bm11). Each line mirrors one `pub` transport wrapper
--- of gab/systemrufe.gab with the C-identical parameter list: `ptr` over a
--- table lowers to `Table *` on both sides, so the owner's memory travels by
--- type, not by number (M140). The tables named here are OWN (`Senden`,
--- `Empfang`, `Adresse`) -- no `use`, single-file green. TRUE effects and
--- the owners' measured costs (the bm9 convention: claims, refuted at the C
--- prototype diff and the link, never by proof from one file).
+-- Border mirrors (lane bm11, Wort-Typen seit bm12). Each line mirrors one
+-- `pub` transport wrapper of gab/systemrufe.gab with the C-identical
+-- parameter list: `ptr` over a table lowers to `Table *` on both sides, so
+-- the owner's memory travels by type, not by number (M140). The tables named
+-- here are OWN (`Adresse`, `PaketWort`, `FangWort`) -- no `use`,
+-- single-file green. Since bm12 the kernel boundary carries PACKED words,
+-- not byte slots (Q-1): `netz_senden2` reads `PaketWort`, `netz_empfangen2`
+-- writes `FangWort`. TRUE effects and the owners' measured costs (the bm9
+-- convention: claims, refuted at the C prototype diff and the link, never
+-- by proof from one file).
 extern fn netz_binden2(fd : u64, adresse : ptr<normal, r> Adresse) -> u64
     effects { reads Adresse.slots } costs <= 14 ops;
-extern fn netz_senden2(fd : u64, nachricht : ptr<normal, r> Senden, laenge : u64) -> u64
-    effects { reads Senden.slots } costs <= 15 ops;
-extern fn netz_empfangen2(fd : u64, puffer : ptr<normal, rw> Empfang, laenge : u64) -> u64
-    effects { writes Empfang.slots } costs <= 15 ops;
+extern fn netz_senden2(fd : u64, nachricht : ptr<normal, r> PaketWort, laenge : u64) -> u64
+    effects { reads PaketWort.slots } costs <= 15 ops;
+extern fn netz_empfangen2(fd : u64, puffer : ptr<normal, rw> FangWort, laenge : u64) -> u64
+    effects { writes FangWort.slots } costs <= 15 ops;
 
 -- Bind this worker's socket to its own address (lane bm11): fill the
 -- twelve `sockaddr_nl` bytes, hand `&Adresse` to the kernel. Answers the
@@ -710,25 +852,35 @@ pub impl fn verbinde(steckdose : u64) -> u64
 }
 
 -- Send the `Senden` bytes the builders left (`laenge` of them) on the
--- worker's socket. Answers the raw answer: a byte count, or a sentinel.
+-- worker's socket (lane bm12): packed into `PaketWort` first, because the
+-- kernel reads wire bytes, not Gabbro slots (Q-1). One slot is one wire
+-- byte, so the count travels unchanged. Answers the raw answer: a byte
+-- count, or a sentinel. No `costs` line: the body calls `packe_senden`,
+-- which walks a `forever` loop (K003).
 pub impl fn sende(steckdose : u64, laenge : u64) -> u64
-    effects { reads Senden.slots }
-    costs <= 19 ops
+    effects { reads Senden, reads Senden.slots, reads PaketWort, writes PaketWort.slots }
 {
-    let v : u64 = netz_senden2(steckdose, &Senden, laenge);
+    packe_senden(laenge);
+    let v : u64 = netz_senden2(steckdose, &PaketWort, laenge);
     return v;
 }
 
--- Receive one netlink datagram straight into `Empfang` (lane bm11): the
--- kernel writes the owner's memory through the pointer -- no mapped
--- buffer, no byte copy, no `lege_empfang` fill from driver code. Answers
--- the raw answer: a byte count for `suche_paket`, or a sentinel
--- (NOCHMAL/PAKETE_VERLOREN/KEIN_WERT -- the driver's contract).
+-- Receive one netlink datagram as packed words straight into `FangWort`
+-- (lane bm12): the kernel writes the owner's memory through the pointer --
+-- then unpacked into the byte-wise `Empfang` working table (`lege_fang`),
+-- which every parser below reads. Answers the raw answer: a byte count for
+-- `suche_paket`, or a sentinel (NOCHMAL/PAKETE_VERLOREN/KEIN_WERT -- the
+-- driver's contract; a sentinel fails the `narrow` and travels back
+-- untouched). No `costs` line (K003, see `sende`).
 pub impl fn empfange(steckdose : u64, laenge : u64) -> u64
-    effects { writes Empfang.slots }
-    costs <= 19 ops
+    effects { reads FangWort, reads FangWort.slots, writes FangWort.slots, reads Empfang, reads Empfang.slots, writes Empfang.slots }
 {
-    let v : u64 = netz_empfangen2(steckdose, &Empfang, laenge);
+    let v : u64 = netz_empfangen2(steckdose, &FangWort, laenge);
+    narrow v to 0 .. 8192 else {
+        return v;
+    }
+    let n : u32 in 0 .. 8192 = u32(v);
+    lege_fang(n);
     return v;
 }
 
@@ -772,10 +924,11 @@ pub impl fn pruefe_quittung(meldung : u32 in 0 .. 8192) -> u32 in 0 .. 1
 -- fail closed, the queue stays unbound and delivers nothing). Answers 0
 -- when every send left with its built length AND every answer ACKed, else
 -- 1 -- the detail stays inside (same philosophy as the border's KEIN_WERT);
--- the operator learns failed-vs-ok from the exit status.
+-- the operator learns failed-vs-ok from the exit status. No `costs` line
+-- since lane bm12: the body calls `sende`/`empfange`, which pack and unpack
+-- through `forever` loops (K003).
 pub impl fn einrichten(steckdose : u64) -> u64
-    effects { reads Adresse, writes Adresse.slots, reads Senden, writes Senden.slots, reads Empfang, reads Empfang.slots, writes Empfang.slots }
-    costs <= 829 ops
+    effects { reads Adresse, writes Adresse.slots, reads Senden, writes Senden.slots, reads PaketWort, writes PaketWort.slots, reads Empfang, reads Empfang.slots, writes Empfang.slots, reads FangWort, writes FangWort.slots }
 {
     let b0 : u64 = verbinde(steckdose);
     if b0 != 0 {
