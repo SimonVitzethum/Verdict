@@ -27,6 +27,12 @@ pub const EIMER : u32 = 1024;
 pub const FACH : u32 = 4;
 pub const ABLAUF : u32 = 300;
 
+-- Watchdog fuer begrenzte Gaenge (lane bm13): divergierend, wie die Form es
+-- verlangt -- wenn die Schranke erschoepft ist, laeuft der Prozess mit keiner
+-- Zahl weiter, die nichts bedeutete (gleiche Form wie `treffer_aufgegeben`
+-- in gab/entscheidung.gab). Fremde Vertrauensbasis, 5. Symbol im Scratch-Stub.
+extern fn verbindung_aufgegeben() -> never effects { diverges };
+
 -- Zustaende: 0 frei, 1 NEU, 2 BESTEHEND, 3 SCHLIESSEND.
 pub table Verbindung count ANZAHL {
     slot {
@@ -347,6 +353,50 @@ pub impl fn lies_stand(w : u32 in 0 .. 3) -> u32
         return Stand.slots[0].treffer;
     }
     return Stand.slots[0].abgelaufen;
+}
+
+-- Fenster-Ablauf (lane bm13): wie `altere`, aber nur 16 Plaetze ab `start`
+-- (der Rufer rotiert das Fenster, siehe `entscheide` in
+-- gab/entscheidung.gab). Der volle Tabellengang passt nicht unter die
+-- `held <= 1024`-Schranke von VSPERRE (K002); 16 Plaetze passen bequem
+-- (32 rissen die Laufzeit-Schranke des Retry -- gemessen im Harness, Abort).
+-- Was ablaeuft, ist dasselbe: aelter als ABLAUF, nie frueh -- ein grobes
+-- Fenster verspaetet nur, es irrt nie. `retry`-Form wie `suche_paket` in
+-- gab/netzverbindung.gab (prueft, traegt ein Total, emittiert).
+pub impl fn altere_fenster(jetzt : u32, start : u32)
+    requires Held(VSPERRE)
+    effects { reads Verbindung, reads Verbindung.slots, writes Verbindung.slots,
+              reads Stand.slots, writes Stand.slots, locks VSPERRE }
+    costs <= 640 ops
+{
+    narrow start to 0 .. 4080 else { return; }
+    let ende : u32 = start + 16;
+    let mut i : u32 in 0 .. 4096 = start;
+    retry span until i >= ende
+        bounded 576 ops
+        on_exceeded verbindung_aufgegeben
+        effects { reads Verbindung, reads Verbindung.slots, writes Verbindung.slots,
+                  reads Stand.slots, writes Stand.slots }
+    {
+        narrow i to 0 .. 4095 else { leave span; }
+        if Verbindung.slots[i].zustand != 0 {
+            if jetzt >= Verbindung.slots[i].gesehen {
+                let alter : u32 = jetzt - Verbindung.slots[i].gesehen;
+                if alter > ABLAUF {
+                    Verbindung.slots[i].zustand = 0;
+                    if Stand.slots[0].abgelaufen < u32::max {
+                        Stand.slots[0].abgelaufen += 1;
+                    }
+                }
+            }
+        }
+        if i < ende {
+            i += 1;
+        } else {
+            leave span;
+        }
+    }
+    return;
 }
 
 }

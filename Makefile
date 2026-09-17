@@ -31,9 +31,9 @@ bau/systemrufe.c: gab/systemrufe.gab bau/netz.gabi
 	$(GABBRO) pruefe --with bau/netz.gabi $< >/dev/null
 	$(GABBRO) emit --with bau/netz.gabi $< > $@
 
-# NOTE (lanes bm7-bm11): the link needs the four diverging exits
-# (treffer_aufgegeben, zaehler_streit, netz_streit, lauf_aufgegeben), which
-# no Gabbro file may define (Befund T-4: H022/K008, C001, N321). No treiber/
+# NOTE (lanes bm7-bm13): the link needs the five diverging exits
+# (treffer_aufgegeben, zaehler_streit, netz_streit, lauf_aufgegeben,
+# verbindung_aufgegeben) (Befund T-4: H022/K008, C001, N321). No treiber/
 # dir exists in this clone, so this step stays red until the treiber lane
 # lands; the scratch stub (out of the tree, never committed) proves linkage
 # instead -- see messung/BERICHT-bm10.md and -bm11.md.

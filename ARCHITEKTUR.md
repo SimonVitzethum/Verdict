@@ -39,6 +39,14 @@ Ethernet header. Lanes bm1–bm11 decoded IPv4-over-Ethernet (EtherType at
 starting with 0x45, and `pakete.gab` decodes bare IPv4 since. The `Kopf`
 shape above is unchanged — only where the bytes come from moved.
 
+**Lane bm13 amendment (fail-closed verdicts, expiry, routing).** Every queued
+packet with a known id gets an explicit verdict: `suche_paket` answers TEIL
+(6) when the id parsed but the rest is unusable, and the driver verdicts
+DROP on it (foreign types without id stay silent — kernel timeout-drop).
+Verdicts route to the packet's own queue (`gib_reihung`, not the compiled-in
+number). Expiry runs as a rotating 16-slot window every 1024th packet
+(`altere_fenster`; a full scan does not fit `held <= 1024` — K002).
+
 **Connection key** — the 5-tuple in canonical direction: the smaller (address, port) pair first,
 so both directions of a flow hash to the same bucket, plus a direction bit carried beside it.
 

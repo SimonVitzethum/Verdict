@@ -112,6 +112,10 @@ pub const TYP_FEHLER : u32 in 0 .. 7 = 2;
 pub const ATTR_FEHLER : u32 in 0 .. 7 = 3;
 pub const IDS_FEHLER : u32 in 0 .. 7 = 4;
 pub const LEER : u32 in 0 .. 7 = 5;
+-- Lane bm13: TEIL -- the packet id is known (PACKET_HDR parsed) but the rest
+-- is unusable (bad attribute, missing/empty payload). The driver answers an
+-- explicit DROP on the known id instead of silence (fail-closed verdicts).
+pub const TEIL : u32 in 0 .. 7 = 6;
 
 pub type Zustand = u32 in 0 .. 7;
 pub type Einzelbyte = u32 in 0 .. 255;
@@ -672,6 +676,24 @@ impl fn ergebnis_leer(grund : Zustand, typ : u32 in 0 .. 65535) -> Zustand
     return grund;
 }
 
+-- Partial result (lane bm13): the packet id is known but the rest is not
+-- (bad attribute or missing/empty payload). Records TEIL with the id so the
+-- driver verdicts DROP on it instead of silence. Same single-write shape as
+-- `ergebnis_leer`.
+impl fn ergebnis_teil(kennung : u32, reihung : u32 in 0 .. 65535, haken : Einzelbyte, typ : u32 in 0 .. 65535) -> Zustand
+    effects { reads Ergebnis, writes Ergebnis.slots }
+    costs <= 20 ops
+{
+    Ergebnis.slots[0].zustand = TEIL;
+    Ergebnis.slots[0].kennung = kennung;
+    Ergebnis.slots[0].versatz = 0;
+    Ergebnis.slots[0].laenge = 0;
+    Ergebnis.slots[0].reihung = reihung;
+    Ergebnis.slots[0].haken = haken;
+    Ergebnis.slots[0].typ = typ;
+    return TEIL;
+}
+
 -- Parse one incoming netlink message of meldung bytes in Empfang: check the
 -- nlmsghdr (length, type), the nfgenmsg (family, version, queue), then walk
 -- the attributes with 4-byte alignment (NLA_ALIGN), gathering the packet id
@@ -702,12 +724,15 @@ pub impl fn suche_paket(meldung : u32 in 0 .. 8192) -> Zustand
         return ergebnis_leer(2, typ);
     }
     let familie : Einzelbyte = Empfang.slots[16].byte;
-    -- Lane bm12 (Befund Q-2): the queue stamps the packet's protocol family
-    -- here -- AF_INET (2) for IPv4, never 0 on a real wire (the bm6 harness
-    -- fed family 0 by hand, which is why this stood so long). Only IPv4
-    -- passes: the decoder in gab/pakete.gab reads IPv4, nothing else.
+    -- Lanes bm12/bm13: the queue stamps the packet's protocol family here --
+    -- AF_INET (2) for IPv4, AF_INET6 (10) for IPv6, never 0 on a real wire.
+    -- Both pass the parse (the id below is family-independent); the decoder
+    -- in gab/pakete.gab reads IPv4 only, so IPv6 ends as an explicit DROP
+    -- verdict, never as silence.
     if familie != 2 {
-        return ergebnis_leer(2, typ);
+        if familie != 10 {
+            return ergebnis_leer(2, typ);
+        }
     }
     let ausgabe : Einzelbyte = Empfang.slots[17].byte;
     if ausgabe != 0 {
@@ -804,13 +829,19 @@ pub impl fn suche_paket(meldung : u32 in 0 .. 8192) -> Zustand
     let t1 : Einzelbyte = Empfang.slots[5].byte;
     let typ_now : u32 in 0 .. 65535 = t0 + t1 * 256;
     if fehler != 0 {
+        if kopf_da == 1 {
+            -- Lane bm13: the id is known, the rest is not -- TEIL, so the
+            -- driver verdicts DROP on the known id instead of silence.
+            return ergebnis_teil(kennung, reihung, haken, typ_now);
+        }
         return ergebnis_leer(fehler, typ_now);
     }
     if kopf_da == 0 {
         return ergebnis_leer(4, typ_now);
     }
     if last_da == 0 {
-        return ergebnis_leer(5, typ_now);
+        -- Lane bm13: header parsed, payload missing or empty -- TEIL.
+        return ergebnis_teil(kennung, reihung, haken, typ_now);
     }
     Ergebnis.slots[0].zustand = 0;
     Ergebnis.slots[0].kennung = kennung;

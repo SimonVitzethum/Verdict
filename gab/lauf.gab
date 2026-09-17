@@ -156,6 +156,7 @@ extern fn suche_paket(meldung : u32 in 0 .. 8192) -> u32 in 0 .. 7 effects { pur
 extern fn gib_laenge() -> u32 in 0 .. 1600 effects { pure } costs <= 4 ops;
 extern fn hole_nutzlast(i : u32 in 0 .. 1599) -> u32 in 0 .. 255 effects { pure } costs <= 16 ops;
 extern fn gib_kennung() -> u32 effects { pure } costs <= 4 ops;
+extern fn gib_reihung() -> u32 in 0 .. 65535 effects { pure } costs <= 4 ops;
 extern fn baue_urteil(kennung : u32, urteil : u32 in 0 .. 2, reihung : u32 in 0 .. 65535) -> u32 in 0 .. 64 effects { pure } costs <= 152 ops;
 extern fn setze_paket(i : u32, w : u32 in 0 .. 255) effects { pure } costs <= 4 ops;
 extern fn entscheide(laenge : u32 in 0 .. 1600, faden : u32 in 0 .. 15) -> u32 in 0 .. 2 effects { pure };
@@ -175,6 +176,12 @@ pub const PAKETE_VERLOREN : u64 = u64::max - 2;
 -- macro, different value, and the composed link would not compile (Befund
 -- T-2). The number here is the queue's NUMBER on the wire (res_id).
 pub const WARTESCHLANGEN_NR : u32 in 0 .. 65535 = 0;
+
+-- Lane bm13: TEIL mirror of gab/netzverbindung.gab's TEIL (6) -- the packet
+-- id is known but the rest is unusable, so the driver answers an explicit
+-- DROP on it instead of silence. Local name (consts do not cross the
+-- single-file gate); follows the owner if it ever moves.
+const TEIL_ZUSTAND : u32 in 0 .. 7 = 6;
 
 -- Receive bound in bytes: what one `empfange` call may write into `Empfang`
 -- and what `suche_paket` may parse. Same number as
@@ -222,15 +229,27 @@ impl fn lade_grundregeln()
 -- One datagram through the decision chain: strict-parse the netlink message
 -- out of Empfang, copy the payload byte by byte into Paket, decide, build
 -- the verdict bytes into Senden. Answers the verdict length for `sende` --
--- 0 when the strict parse refused (then no verdict was built, never a
--- guess: the same discipline as `suche_paket`'s named Zustand and
--- `entpacke`'s `ungueltig`). `pub`: the measurement harness calls it
+-- 0 only when the strict parse refused without a trustworthy packet id
+-- (never a guess: the same discipline as `suche_paket`'s named Zustand and
+-- `entpacke`'s `ungueltig`); a refusal WITH a known id (TEIL, lane bm13)
+-- answers a DROP verdict instead. `pub`: the measurement harness calls it
 -- directly (BERICHT-bm11.md).
 pub impl fn behandle(meldung : u32 in 0 .. 8192) -> u32 in 0 .. 64
     effects { pure }
 {
     let zustand : u32 in 0 .. 7 = suche_paket(meldung);
     if zustand != 0 {
+        -- Lane bm13: TEIL carries a known packet id with unusable rest --
+        -- answer an explicit DROP on it (fail-closed verdicts) instead of
+        -- holding the packet silent. Any other refusal has no trustworthy
+        -- id: silence (kernel timeout-drop), counted in `strikt` by the
+        -- caller, exactly as before.
+        if zustand == TEIL_ZUSTAND {
+            let kennung : u32 = gib_kennung();
+            let reihung : u32 in 0 .. 65535 = gib_reihung();
+            let teil_lang : u32 in 0 .. 64 = baue_urteil(kennung, 0, reihung);
+            return teil_lang;
+        }
         return 0;
     }
     -- The payload copy: n bytes (`gib_laenge`, 0 .. 1600) out of Empfang
@@ -258,11 +277,14 @@ pub impl fn behandle(meldung : u32 in 0 .. 8192) -> u32 in 0 .. 64
         i += 1;
     }
     -- Decide on this worker (faden 0: one worker, queue 0 -- K-1) and build
-    -- the verdict over the parsed packet id. `kennung` is read AFTER the
-    -- decision (V4): no name here can go stale.
+    -- the verdict over the parsed packet id. `kennung` and `reihung` are
+    -- read AFTER the decision (V4): no name here can go stale. The verdict
+    -- routes to the packet's own queue (lane bm13: `gib_reihung`, not the
+    -- compiled-in number -- one worker can serve several queues).
     let urteil : u32 in 0 .. 2 = entscheide(n, 0);
     let kennung : u32 = gib_kennung();
-    let lang : u32 in 0 .. 64 = baue_urteil(kennung, urteil, WARTESCHLANGEN_NR);
+    let reihung : u32 in 0 .. 65535 = gib_reihung();
+    let lang : u32 in 0 .. 64 = baue_urteil(kennung, urteil, reihung);
     return lang;
 }
 

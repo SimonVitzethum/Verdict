@@ -11,14 +11,15 @@ STUB="$AB/stub.c"
 OUT="$AB/share/verdict"
 mkdir -p "$AB/share"
 printf '%s\n' \
-  '/* Scratch-Stub bm11: nur die 4 divergierenden Exits (abort).' \
+  '/* Scratch-Stub bm13: nur die 5 divergierenden Exits (abort).' \
   '   Erzeugt von vm/baue-binary.sh, nie committen (Makefile-NOTE).' \
   '   VSPERRE kommt aus gab/sperre.gab. */' \
   '#include <stdlib.h>' \
   '_Noreturn void zaehler_streit(void) { abort(); }' \
   '_Noreturn void netz_streit(void) { abort(); }' \
   '_Noreturn void lauf_aufgegeben(void) { abort(); }' \
-  '_Noreturn void treffer_aufgegeben(void) { abort(); }' > "$STUB"
+  '_Noreturn void treffer_aufgegeben(void) { abort(); }' \
+  '_Noreturn void verbindung_aufgegeben(void) { abort(); }' > "$STUB"
 make -C "$REPO" pruefen >/dev/null
 make -C "$REPO" >/dev/null 2>&1 || true   # Link ohne treiber/ bleibt rot (NOTE)
 cc -std=c11 -Wall -Wextra -Werror -O2 -pthread -I "$REPO/bau" \
